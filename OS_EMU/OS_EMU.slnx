@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="OS_EMU/OS_EMU.vcxproj" />
+  <Project Path="OS_EMU/OS_EMU.vcxproj" Id="ca9623de-17bb-4389-a5ec-62e948960fff" />
 </Solution>
