@@ -142,8 +142,15 @@
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Config.h" />
+    <ClInclude Include="Instruction.h" />
+    <ClInclude Include="Instructiongenerator.h" />
+    <ClInclude Include="Scheduler.h" />
     <ClInclude Include="frontend.h" />
-    <ClInclude Include="placeholder.h" />
+    <ClInclude Include="Process.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Text Include="Config.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
