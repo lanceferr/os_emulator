@@ -1,4 +1,4 @@
-// libraries
+    // libraries
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -184,17 +184,10 @@ static void enterScreen(std::shared_ptr<Process> p) {
         }
         else if (line == "process-smi") {
             if (p->state == ProcessState::FINISHED) {
+                std::cout << ("Finished!\n");
+            } else {
                 processSmi(p);
-                std::cout << "(Process finished. Returning to main menu.)\n";
-#ifdef _WIN32
-                system("cls");
-#else
-                system("clear");
-#endif
-                printMenu();
-                break;
             }
-            processSmi(p);
         }
         else {
             std::cout << "Unknown command inside screen. Try 'process-smi' or 'exit'.\n";
@@ -336,7 +329,7 @@ int main() {
                 std::lock_guard<std::mutex> lock(allProcessesMutex);
                 p = findProcess(pname, allProcesses);
             }
-            if (!p || p->state == ProcessState::FINISHED) {
+            if (!p) {
                 std::cout << "Process " << pname << " not found.\n";
             }
             else {
