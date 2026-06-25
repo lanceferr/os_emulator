@@ -64,6 +64,8 @@ public:
         execStack.push_back({ &program, 0, 0 });
     }
 
+
+
     static std::string getCurrentTimestamp() {
         auto now = std::chrono::system_clock::now();
         std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -167,7 +169,8 @@ private:
             std::string msg = ins.printLiteralMsg;
             if (!ins.printVarName.empty()) {
                 uint16_t v = resolve(Operand::fromVar(ins.printVarName));
-                msg += " " + std::to_string(v);
+                //msg += " " + std::to_string(v);
+                msg += ins.printVarName + " " + std::to_string(v);
             }
             appendLog("\"" + msg + "\"", core);
             break;
