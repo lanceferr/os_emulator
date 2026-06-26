@@ -228,6 +228,8 @@ private:
                 readyQueue.push(proc);
                 lock.unlock();
                 queueCV.notify_one();
+                // Don't sleep - immediately try to grab a new process
+                continue;
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
