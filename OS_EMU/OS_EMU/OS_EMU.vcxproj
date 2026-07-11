@@ -140,6 +140,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="MemoryManager.h" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Config.h" />

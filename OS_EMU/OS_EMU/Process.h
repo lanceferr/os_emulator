@@ -1,3 +1,4 @@
+//Process.h
 #pragma once
 #include <string>
 #include <vector>
@@ -54,6 +55,10 @@ public:
 
     // SLEEP bookkeeping: ticks remaining before this process can run again
     int sleepTicksRemaining;
+
+    // Set to true once the MemoryManager has given this process its fixed
+    // mem-per-proc block. The block is held until the process finishes.
+    bool memAllocated = false;
 
     Process(const std::string& name, int pid, std::vector<Instruction> programIn, int totalFlatCount)
         : name(name), pid(pid), state(ProcessState::READY), coreId(-1),

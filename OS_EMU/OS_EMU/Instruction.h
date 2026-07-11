@@ -1,4 +1,4 @@
-// Instruction.h
+//instruction.h
 #pragma once
 #include <string>
 #include <vector>

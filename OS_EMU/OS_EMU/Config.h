@@ -1,3 +1,4 @@
+//Config.h
 #pragma once
 #include <string>
 #include <fstream>
@@ -15,6 +16,11 @@ struct Config {
     uint32_t minIns = 1;
     uint32_t maxIns = 1;
     uint32_t delaysPerExec = 0;
+
+    // Memory manager parameters (first-fit flat allocator)
+    uint32_t maxOverallMem = 16384;
+    uint32_t memPerFrame = 16;
+    uint32_t memPerProc = 4096;
 
     bool loaded = false;
 };
@@ -71,6 +77,30 @@ public:
                 long v; file >> v;
                 out.delaysPerExec = static_cast<uint32_t>(v);
             }
+            else if (key == "max-overall-mem") {
+                long v; file >> v;
+                if (v <= 0) {
+                    std::cout << "Error: max-overall-mem must be positive.\n";
+                    return false;
+                }
+                out.maxOverallMem = static_cast<uint32_t>(v);
+            }
+            else if (key == "mem-per-frame") {
+                long v; file >> v;
+                if (v <= 0) {
+                    std::cout << "Error: mem-per-frame must be positive.\n";
+                    return false;
+                }
+                out.memPerFrame = static_cast<uint32_t>(v);
+            }
+            else if (key == "mem-per-proc") {
+                long v; file >> v;
+                if (v <= 0) {
+                    std::cout << "Error: mem-per-proc must be positive.\n";
+                    return false;
+                }
+                out.memPerProc = static_cast<uint32_t>(v);
+            }
             else {
                 // Unknown key: skip its value token and continue (forward-compatible)
                 std::string skip; file >> skip;
@@ -79,6 +109,11 @@ public:
 
         if (out.minIns > out.maxIns) {
             std::cout << "Error: min-ins cannot exceed max-ins.\n";
+            return false;
+        }
+
+        if (out.memPerProc > out.maxOverallMem) {
+            std::cout << "Error: mem-per-proc cannot exceed max-overall-mem.\n";
             return false;
         }
 

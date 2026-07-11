@@ -1,6 +1,8 @@
+//Scheduler.h
 #pragma once
 #include "Process.h"
 #include "Config.h"
+#include "MemoryManager.h"
 #include <queue>
 #include <vector>
 #include <thread>
@@ -16,6 +18,23 @@
 // delays-per-exec), then the loop yields briefly so it doesn't spin the CPU at
 // 100%. SLEEP instructions decrement a per-process tick counter rather than
 // blocking the worker thread, so a sleeping process correctly frees its core.
+//
+// Memory note:
+// Each process needs a fixed mem-per-proc sized block from the flat,
+// first-fit MemoryManager before it may run for the first time. The block is
+// held for the process's entire lifetime (it is NOT released across quantum
+// preemptions or sleeps) and is only freed once the process finishes. If no
+// block is available when a process reaches the front of the ready queue, it
+// is sent to the back of the queue instead of being dispatched (no backing
+// store).
+//
+// Snapshot note:
+// A memory_stamp_<qq>.txt is written every time the shared CPU tick counter
+// crosses a new multiple of quantum-cycles. This check happens inline, right
+// where cpuTicks is incremented (see tickAndMaybeSnapshot below), guarded by
+// a single mutex — not on a separately-polled timer. That guarantees exactly
+// one snapshot per quantum-cycles ticks: no double-fires from polling drift,
+// no skipped boundaries, and no dedicated background thread.
 class Scheduler {
 private:
     int numCores;
@@ -39,10 +58,18 @@ private:
     std::atomic<bool> running;
     std::atomic<uint64_t> cpuTicks;
 
+    MemoryManager memMgr;
+    std::mutex snapshotMutex;
+    uint64_t nextSnapshotTick;
+    int snapshotCounter;
+
 public:
-    Scheduler(int numCores, SchedulerType type, uint32_t quantumCycles, uint32_t delaysPerExec)
+    Scheduler(int numCores, SchedulerType type, uint32_t quantumCycles, uint32_t delaysPerExec,
+        size_t maxOverallMem, size_t memPerFrame, size_t memPerProc)
         : numCores(numCores), type(type), quantumCycles(quantumCycles),
-        delaysPerExec(delaysPerExec), running(false), cpuTicks(0) {
+        delaysPerExec(delaysPerExec), running(false), cpuTicks(0),
+        memMgr(maxOverallMem, memPerFrame, memPerProc),
+        nextSnapshotTick(quantumCycles > 0 ? quantumCycles : 1), snapshotCounter(0) {
         runningProcesses.resize(numCores, nullptr);
         quantumUsed.resize(numCores, 0);
         delayCounters.resize(numCores, 0);
@@ -104,6 +131,9 @@ public:
         return busy;
     }
 
+    int getProcessesInMemory() { return memMgr.getProcessCount(); }
+    size_t getExternalFragmentation() { return memMgr.getExternalFragmentation(); }
+
 private:
     // Moves a finished/sleeping process off its core slot and either requeues
     // it (sleep) or files it as finished.
@@ -119,11 +149,15 @@ private:
             proc->state = ProcessState::FINISHED;
             proc->finishedAt = Process::getCurrentTimestamp();
             proc->coreId = -1;
+            // Process is done with its memory footprint for good.
+            memMgr.deallocate(proc->pid);
             std::lock_guard<std::mutex> flock(finishedMutex);
             finishedProcesses.push_back(proc);
         }
         else {
             // Either sleeping or RR quantum expired: back to ready queue.
+            // Memory is NOT released here; the process keeps its block until
+            // it actually finishes.
             proc->coreId = -1;
             if (proc->state != ProcessState::WAITING) {
                 proc->state = ProcessState::READY;
@@ -170,6 +204,22 @@ private:
                 readyQueue.pop();
                 lock.unlock();
 
+                // Memory gate: a process needs its fixed-size block before it
+                // may run for the very first time. If memory is full, it goes
+                // to the tail of the ready queue instead (no backing store).
+                if (!proc->memAllocated) {
+                    bool got = memMgr.allocate(proc->name, proc->pid);
+                    if (!got) {
+                        std::unique_lock<std::mutex> lock2(queueMutex);
+                        readyQueue.push(proc);
+                        lock2.unlock();
+                        queueCV.notify_one();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        continue;
+                    }
+                    proc->memAllocated = true;
+                }
+
                 {
                     std::lock_guard<std::mutex> rlock(runningMutex);
                     proc->state = ProcessState::RUNNING;
@@ -185,14 +235,14 @@ private:
                 std::lock_guard<std::mutex> rlock(runningMutex);
                 if (delayCounters[coreId] > 0) {
                     delayCounters[coreId]--;
-                    cpuTicks++;
+                    tickAndMaybeSnapshot();
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     continue;
                 }
             }
 
             bool didWork = proc->executeOneStep(coreId);
-            cpuTicks++;
+            tickAndMaybeSnapshot();
 
             if (!didWork || proc->isFinished()) {
                 retireFromCore(coreId, proc);
@@ -222,17 +272,31 @@ private:
 
             if (quantumExpired) {
                 // Preempt: process goes to the back of the ready queue, core is freed.
+                // It keeps its memory block.
                 proc->state = ProcessState::READY;
                 proc->coreId = -1;
                 std::unique_lock<std::mutex> lock(queueMutex);
                 readyQueue.push(proc);
                 lock.unlock();
                 queueCV.notify_one();
-                // Don't sleep - immediately try to grab a new process
-                continue;
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+
+    // Increments the shared tick counter by exactly one and, if that crosses
+    // a new multiple of quantum-cycles, writes exactly one memory_stamp_<qq>.txt.
+    // Because this runs inline (not on a polled timer) and nextSnapshotTick is
+    // advanced by precisely quantumCycles under the same lock, every core's
+    // tick is accounted for exactly once — no double-fires, no gaps.
+    void tickAndMaybeSnapshot() {
+        uint64_t ticks = ++cpuTicks;
+        std::lock_guard<std::mutex> lock(snapshotMutex);
+        if (quantumCycles > 0 && ticks >= nextSnapshotTick) {
+            snapshotCounter++;
+            memMgr.writeSnapshot(snapshotCounter);
+            nextSnapshotTick += quantumCycles;
         }
     }
 };

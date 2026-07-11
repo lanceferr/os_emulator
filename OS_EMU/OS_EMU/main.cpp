@@ -1,3 +1,4 @@
+//main.cpp
     // libraries
 #include <iostream>
 #include <sstream>
@@ -46,9 +47,9 @@ std::shared_ptr<Process> createProcess(const std::string& name, int numInstructi
     int flatTotal = countFlatInstructions(program);
     auto p = std::make_shared<Process>(name, pidCounter++, std::move(program), flatTotal);
 
-	p->variables["x"] = 0;
-	p->variables["y"] = 0;
-	p->variables["z"] = 0;
+    p->variables["x"] = 0;
+    p->variables["y"] = 0;
+    p->variables["z"] = 0;
 
     return p;
 }
@@ -185,7 +186,8 @@ static void enterScreen(std::shared_ptr<Process> p) {
         else if (line == "process-smi") {
             if (p->state == ProcessState::FINISHED) {
                 std::cout << ("Finished!\n");
-            } else {
+            }
+            else {
                 processSmi(p);
             }
         }
@@ -266,7 +268,8 @@ int main() {
                     continue;
                 }
                 scheduler = std::make_unique<Scheduler>(
-                    config.numCPU, config.scheduler, config.quantumCycles, config.delaysPerExec);
+                    config.numCPU, config.scheduler, config.quantumCycles, config.delaysPerExec,
+                    config.maxOverallMem, config.memPerFrame, config.memPerProc);
                 scheduler->start();
                 initialized = true;
                 std::cout << "Initialized with " << config.numCPU << " core(s), scheduler="
@@ -337,30 +340,30 @@ int main() {
             }
         }
         else if (line == "scheduler-start") {
-			////use this if RANDOM generation mode instead of XYZ counter mode
-   //         if (batchGenActive.load()) {
-   //             std::cout << "Batch process generation is already running.\n";
-   //         }
-   //         else {
-   //             batchGenActive.store(true);
-   //             batchGenThread = std::thread(batchGenLoop, &allProcesses, &allProcessesMutex);
-   //             std::cout << "Started generating dummy processes every "
-   //                 << config.batchProcessFreq << " tick(s).\n";
-   //         }
-
-            //use this if XYZ counter mode instead of random generation
-            // Switch to deterministic XYZ counter mode, then start generation
-            insGen.setMode(GenerationMode::XYZ_COUNTER);
+            ////use this if RANDOM generation mode instead of XYZ counter mode
             if (batchGenActive.load()) {
-                std::cout << "Mode switched to XYZ counter. "
-                    "New processes will use the FOR loop.\n";
+                std::cout << "Batch process generation is already running.\n";
             }
             else {
                 batchGenActive.store(true);
                 batchGenThread = std::thread(batchGenLoop, &allProcesses, &allProcessesMutex);
-                std::cout << "Started XYZ counter processes every "
+                std::cout << "Started generating dummy processes every "
                     << config.batchProcessFreq << " tick(s).\n";
             }
+
+            //use this if XYZ counter mode instead of random generation
+            // Switch to deterministic XYZ counter mode, then start generation
+            //insGen.setMode(GenerationMode::XYZ_COUNTER);
+            //if (batchGenActive.load()) {
+            //    std::cout << "Mode switched to XYZ counter. "
+            //        "New processes will use the FOR loop.\n";
+            //}
+            //else {
+            //    batchGenActive.store(true);
+            //    batchGenThread = std::thread(batchGenLoop, &allProcesses, &allProcessesMutex);
+            //    std::cout << "Started XYZ counter processes every "
+            //        << config.batchProcessFreq << " tick(s).\n";
+            //}
         }
         else if (line == "scheduler-stop") {
             if (!batchGenActive.load()) {
