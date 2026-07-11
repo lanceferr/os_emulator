@@ -145,6 +145,7 @@
     <ClInclude Include="Config.h" />
     <ClInclude Include="Instruction.h" />
     <ClInclude Include="Instructiongenerator.h" />
+    <ClInclude Include="MemoryAllocator.h" />
     <ClInclude Include="Scheduler.h" />
     <ClInclude Include="frontend.h" />
     <ClInclude Include="Process.h" />

@@ -55,16 +55,17 @@ public:
     // SLEEP bookkeeping: ticks remaining before this process can run again
     int sleepTicksRemaining;
 
+    // Memory allocation (Week 10): base address assigned by MemoryAllocator (-1 = not yet allocated)
+    int memStartAddr;
+
     Process(const std::string& name, int pid, std::vector<Instruction> programIn, int totalFlatCount)
         : name(name), pid(pid), state(ProcessState::READY), coreId(-1),
         instructionsExecuted(0), totalInstructions(totalFlatCount),
-        sleepTicksRemaining(0) {
+        sleepTicksRemaining(0), memStartAddr(-1) {
         program = std::move(programIn);
         createdAt = getCurrentTimestamp();
         execStack.push_back({ &program, 0, 0 });
     }
-
-
 
     static std::string getCurrentTimestamp() {
         auto now = std::chrono::system_clock::now();
@@ -169,8 +170,7 @@ private:
             std::string msg = ins.printLiteralMsg;
             if (!ins.printVarName.empty()) {
                 uint16_t v = resolve(Operand::fromVar(ins.printVarName));
-                //msg += " " + std::to_string(v);
-                msg += ins.printVarName + " " + std::to_string(v);
+                msg += " " + std::to_string(v);
             }
             appendLog("\"" + msg + "\"", core);
             break;

@@ -1,6 +1,7 @@
 #pragma once
 #include "Process.h"
 #include "Config.h"
+#include "MemoryAllocator.h"
 #include <queue>
 #include <vector>
 #include <thread>
@@ -39,10 +40,14 @@ private:
     std::atomic<bool> running;
     std::atomic<uint64_t> cpuTicks;
 
+    // Memory manager (Week 10)
+    MemoryAllocator* memAlloc = nullptr; // optional; null = no memory management
+    std::atomic<uint64_t> quantumCounter; // how many full quantums have elapsed across all cores
+
 public:
     Scheduler(int numCores, SchedulerType type, uint32_t quantumCycles, uint32_t delaysPerExec)
         : numCores(numCores), type(type), quantumCycles(quantumCycles),
-        delaysPerExec(delaysPerExec), running(false), cpuTicks(0) {
+        delaysPerExec(delaysPerExec), running(false), cpuTicks(0), quantumCounter(0) {
         runningProcesses.resize(numCores, nullptr);
         quantumUsed.resize(numCores, 0);
         delayCounters.resize(numCores, 0);
@@ -65,6 +70,10 @@ public:
         for (auto& t : workerThreads)
             if (t.joinable()) t.join();
         workerThreads.clear();
+    }
+
+    void setMemoryAllocator(MemoryAllocator* alloc) {
+        memAlloc = alloc;
     }
 
     void addProcess(std::shared_ptr<Process> process) {
@@ -119,6 +128,11 @@ private:
             proc->state = ProcessState::FINISHED;
             proc->finishedAt = Process::getCurrentTimestamp();
             proc->coreId = -1;
+            // Release memory when the process finishes (not on preemption).
+            if (memAlloc != nullptr && proc->memStartAddr != -1) {
+                memAlloc->free(proc->name);
+                proc->memStartAddr = -1;
+            }
             std::lock_guard<std::mutex> flock(finishedMutex);
             finishedProcesses.push_back(proc);
         }
@@ -169,6 +183,24 @@ private:
 
                 readyQueue.pop();
                 lock.unlock();
+
+                // Memory allocation check: if a memory manager is attached,
+                // try to allocate memPerProc bytes for this process.
+                // If memory is full, send it to the back of the ready queue
+                // (no backing store per spec) and let this core idle briefly.
+                if (memAlloc != nullptr && proc->memStartAddr == -1) {
+                    uint32_t addr = 0;
+                    if (!memAlloc->allocate(proc->name, addr)) {
+                        // Memory full: requeue at tail, core goes idle.
+                        proc->state = ProcessState::READY;
+                        std::unique_lock<std::mutex> ql(queueMutex);
+                        readyQueue.push(proc);
+                        ql.unlock();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                        continue;
+                    }
+                    proc->memStartAddr = static_cast<int>(addr);
+                }
 
                 {
                     std::lock_guard<std::mutex> rlock(runningMutex);
@@ -221,6 +253,11 @@ private:
             }
 
             if (quantumExpired) {
+                // Write memory snapshot every quantum if memory manager is active.
+                if (memAlloc != nullptr) {
+                    uint64_t qq = ++quantumCounter;
+                    memAlloc->writeSnapshot(qq);
+                }
                 // Preempt: process goes to the back of the ready queue, core is freed.
                 proc->state = ProcessState::READY;
                 proc->coreId = -1;

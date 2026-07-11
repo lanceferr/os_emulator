@@ -1,4 +1,4 @@
-    // libraries
+// libraries
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -16,11 +16,17 @@
 #include "Scheduler.h"
 #include "Config.h"
 #include "InstructionGenerator.h"
+#include "MemoryAllocator.h"
 
 static int pidCounter = 1;
 static Config config;
 static std::unique_ptr<Scheduler> scheduler;
+static std::unique_ptr<MemoryAllocator> memAlloc;
 static InstructionGenerator insGen;
+
+// Switchable instruction generation mode, controlled by the "gen-mode" command.
+enum class GenMode { RANDOM, ALTERNATING_XY };
+static GenMode genMode = GenMode::RANDOM;
 
 static std::atomic<bool> batchGenActive(false);
 static std::thread batchGenThread;
@@ -42,14 +48,12 @@ static int countFlatInstructions(const std::vector<Instruction>& list) {
 }
 
 std::shared_ptr<Process> createProcess(const std::string& name, int numInstructions) {
-    auto program = insGen.generate(name, numInstructions);
+    std::vector<Instruction> program;
+        // Default: randomized mix of DECLARE/ADD/SUBTRACT/SLEEP/PRINT/FOR.
+        program = insGen.generate(name, numInstructions);
+
     int flatTotal = countFlatInstructions(program);
     auto p = std::make_shared<Process>(name, pidCounter++, std::move(program), flatTotal);
-
-	p->variables["x"] = 0;
-	p->variables["y"] = 0;
-	p->variables["z"] = 0;
-
     return p;
 }
 
@@ -62,6 +66,7 @@ void printHelp() {
     std::cout << "  scheduler-start         - Begin generating dummy processes\n";
     std::cout << "  scheduler-stop          - Stop generating dummy processes\n";
     std::cout << "  report-util             - Show CPU utilization, save to csopesy-log.txt\n";
+    std::cout << "  gen-mode <random|altxy> - Switch instruction generation mode (current default: random)\n";
     std::cout << "  clear                   - Clear the screen\n";
     std::cout << "  exit                    - Exit the emulator\n\n";
 }
@@ -184,10 +189,17 @@ static void enterScreen(std::shared_ptr<Process> p) {
         }
         else if (line == "process-smi") {
             if (p->state == ProcessState::FINISHED) {
-                std::cout << ("Finished!\n");
-            } else {
                 processSmi(p);
+                std::cout << "(Process finished. Returning to main menu.)\n";
+#ifdef _WIN32
+                system("cls");
+#else
+                system("clear");
+#endif
+                printMenu();
+                break;
             }
+            processSmi(p);
         }
         else {
             std::cout << "Unknown command inside screen. Try 'process-smi' or 'exit'.\n";
@@ -267,6 +279,16 @@ int main() {
                 }
                 scheduler = std::make_unique<Scheduler>(
                     config.numCPU, config.scheduler, config.quantumCycles, config.delaysPerExec);
+
+                // Attach memory allocator if memory config is present
+                if (config.maxOverallMem > 0 && config.memPerProc > 0) {
+                    memAlloc = std::make_unique<MemoryAllocator>(
+                        config.maxOverallMem, config.memPerProc, config.memPerFrame);
+                    scheduler->setMemoryAllocator(memAlloc.get());
+                    std::cout << "Memory allocator: " << config.maxOverallMem << " bytes total, "
+                        << config.memPerProc << " bytes per process.\n";
+                }
+
                 scheduler->start();
                 initialized = true;
                 std::cout << "Initialized with " << config.numCPU << " core(s), scheduler="
@@ -329,7 +351,7 @@ int main() {
                 std::lock_guard<std::mutex> lock(allProcessesMutex);
                 p = findProcess(pname, allProcesses);
             }
-            if (!p) {
+            if (!p || p->state == ProcessState::FINISHED) {
                 std::cout << "Process " << pname << " not found.\n";
             }
             else {
@@ -337,28 +359,13 @@ int main() {
             }
         }
         else if (line == "scheduler-start") {
-			////use this if RANDOM generation mode instead of XYZ counter mode
-   //         if (batchGenActive.load()) {
-   //             std::cout << "Batch process generation is already running.\n";
-   //         }
-   //         else {
-   //             batchGenActive.store(true);
-   //             batchGenThread = std::thread(batchGenLoop, &allProcesses, &allProcessesMutex);
-   //             std::cout << "Started generating dummy processes every "
-   //                 << config.batchProcessFreq << " tick(s).\n";
-   //         }
-
-            //use this if XYZ counter mode instead of random generation
-            // Switch to deterministic XYZ counter mode, then start generation
-            insGen.setMode(GenerationMode::XYZ_COUNTER);
             if (batchGenActive.load()) {
-                std::cout << "Mode switched to XYZ counter. "
-                    "New processes will use the FOR loop.\n";
+                std::cout << "Batch process generation is already running.\n";
             }
             else {
                 batchGenActive.store(true);
                 batchGenThread = std::thread(batchGenLoop, &allProcesses, &allProcessesMutex);
-                std::cout << "Started XYZ counter processes every "
+                std::cout << "Started generating dummy processes every "
                     << config.batchProcessFreq << " tick(s).\n";
             }
         }
@@ -374,6 +381,20 @@ int main() {
         }
         else if (line == "report-util") {
             reportUtil();
+        }
+        else if (line.rfind("gen-mode ", 0) == 0) {
+            std::string mode = line.substr(9);
+            if (mode == "random") {
+                genMode = GenMode::RANDOM;
+                std::cout << "Generation mode set to: random.\n";
+            }
+            else if (mode == "altxy") {
+                genMode = GenMode::ALTERNATING_XY;
+                std::cout << "Generation mode set to: alternating PRINT/ADD(x).\n";
+            }
+            else {
+                std::cout << "Usage: gen-mode <random|altxy>\n";
+            }
         }
         else {
             std::cout << "Unknown command: '" << line << "'. Type 'help' for options.\n";

@@ -16,6 +16,11 @@ struct Config {
     uint32_t maxIns = 1;
     uint32_t delaysPerExec = 0;
 
+    // Memory manager (Week 10)
+    uint32_t maxOverallMem = 16384;
+    uint32_t memPerFrame = 16;
+    uint32_t memPerProc = 4096;
+
     bool loaded = false;
 };
 
@@ -70,6 +75,18 @@ public:
             else if (key == "delays-per-exec") {
                 long v; file >> v;
                 out.delaysPerExec = static_cast<uint32_t>(v);
+            }
+            else if (key == "max-overall-mem") {
+                long v; file >> v;
+                out.maxOverallMem = static_cast<uint32_t>(v);
+            }
+            else if (key == "mem-per-frame") {
+                long v; file >> v;
+                out.memPerFrame = static_cast<uint32_t>(v);
+            }
+            else if (key == "mem-per-proc") {
+                long v; file >> v;
+                out.memPerProc = static_cast<uint32_t>(v);
             }
             else {
                 // Unknown key: skip its value token and continue (forward-compatible)
