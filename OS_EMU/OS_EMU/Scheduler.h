@@ -2,6 +2,8 @@
 #include "Process.h"
 #include "Config.h"
 #include "IMemoryAllocator.h"
+#include "MemoryAllocator.h"
+#include "PagingAllocator.h"
 #include <queue>
 #include <vector>
 #include <thread>
@@ -44,6 +46,7 @@ private:
     // concrete scheme (flat/first-fit vs. paging) is swappable via config.
     IMemoryAllocator* memAlloc = nullptr; // optional; null = no memory management
     std::atomic<uint64_t> quantumCounter; // how many full quantums have elapsed across all cores
+    size_t memPerProc = 0;
 
 public:
     Scheduler(int numCores, SchedulerType type, uint32_t quantumCycles, uint32_t delaysPerExec)
@@ -77,6 +80,12 @@ public:
         memAlloc = alloc;
     }
 
+    // Overload to provide per-process allocation size when attaching allocator
+    void setMemoryAllocator(IMemoryAllocator* alloc, size_t memPerProc) {
+        memAlloc = alloc;
+        this->memPerProc = memPerProc;
+    }
+
     IMemoryAllocator* getMemoryAllocator() const {
         return memAlloc;
     }
@@ -87,6 +96,9 @@ public:
         lock.unlock();
         queueCV.notify_one();
     }
+
+    // Allow setting per-process memory allocation size when attaching allocator
+    void setMemPerProc(size_t size) { memPerProc = size; }
 
     std::vector<std::shared_ptr<Process>> getRunningProcesses() {
         std::lock_guard<std::mutex> lock(runningMutex);
@@ -135,7 +147,8 @@ private:
             proc->coreId = -1;
             // Release memory when the process finishes (not on preemption).
             if (memAlloc != nullptr && proc->memStartAddr != -1) {
-                memAlloc->free(proc->name);
+                memAlloc->deallocate(proc->memHandle);
+                proc->memHandle = nullptr;
                 proc->memStartAddr = -1;
             }
             std::lock_guard<std::mutex> flock(finishedMutex);
@@ -193,9 +206,9 @@ private:
                 // try to allocate memPerProc bytes for this process.
                 // If memory is full, send it to the back of the ready queue
                 // (no backing store per spec) and let this core idle briefly.
-                if (memAlloc != nullptr && proc->memStartAddr == -1) {
-                    uint32_t addr = 0;
-                    if (!memAlloc->allocate(proc->name, addr)) {
+                if (memAlloc != nullptr && proc->memHandle == nullptr) {
+                    void* handle = memAlloc->allocate(memPerProc);
+                    if (!handle) {
                         // Memory full: requeue at tail, core goes idle.
                         proc->state = ProcessState::READY;
                         std::unique_lock<std::mutex> ql(queueMutex);
@@ -204,7 +217,8 @@ private:
                         std::this_thread::sleep_for(std::chrono::milliseconds(20));
                         continue;
                     }
-                    proc->memStartAddr = static_cast<int>(addr);
+                    proc->memHandle = handle;
+                    proc->memStartAddr = 0; // unknown/opaque for paging
                 }
 
                 {
@@ -261,7 +275,22 @@ private:
                 // Write memory snapshot every quantum if memory manager is active.
                 if (memAlloc != nullptr) {
                     uint64_t qq = ++quantumCounter;
-                    memAlloc->writeSnapshot(qq);
+                    if (auto* flat = dynamic_cast<MemoryAllocator*>(memAlloc)) {
+                        flat->writeSnapshot(qq);
+                    }
+                    else if (auto* paging = dynamic_cast<PagingAllocator*>(memAlloc)) {
+                        paging->writeSnapshot(qq);
+                    }
+                    else {
+                        // fallback: write raw visualization
+                        std::ostringstream fname;
+                        fname << "mem-snap-" << qq << ".txt";
+                        std::ofstream out(fname.str());
+                        if (out.is_open()) {
+                            out << memAlloc->visualizeMemory();
+                            out.close();
+                        }
+                    }
                 }
                 // Preempt: process goes to the back of the ready queue, core is freed.
                 proc->state = ProcessState::READY;

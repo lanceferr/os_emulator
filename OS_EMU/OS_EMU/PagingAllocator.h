@@ -1,99 +1,87 @@
 // PagingAllocator.h
 #pragma once
 #include "IMemoryAllocator.h"
-#include <string>
 #include <vector>
 #include <queue>
 #include <unordered_map>
-#include <unordered_set>
 #include <mutex>
-#include <fstream>
 #include <sstream>
-#include <iomanip>
-#include <chrono>
-#include <ctime>
+#include <cstdint>
 
-// One entry per virtual page of a process.
-struct PageTableEntry {
-    bool valid = false;          // is this page currently resident in a physical frame?
-    int  frameNumber = -1;       // which physical frame, if valid
-    bool everSwappedOut = false; // has this page ever been written to the backing store?
-                                  // (used to decide whether a reload counts as a "page-in")
-};
-
-class PagingAllocator : public IMemoryAllocator {
+class PagingAllocator : public IMemoryAllocator
+{
 private:
-    uint32_t totalMem;
-    uint32_t memPerProc;
-    uint32_t frameSize;
-    int numFrames;
-    int pagesPerProc; // ceil(memPerProc / frameSize)
+    // One entry per virtual page of a single allocation.
+    struct PageTableEntry
+    {
+        bool valid = false;          // resident in a physical frame right now?
+        int  frameNumber = -1;       // which physical frame, if valid
+        bool everSwappedOut = false; // has this page ever hit the backing store?
+    };
 
-    std::vector<bool>        frameOccupied; // frame table: is frame i in use?
-    std::vector<std::string> frameOwner;    // frame table: which process owns frame i
+    // One allocation = one contiguous run of virtual pages handed out by a
+    // single allocate() call. This replaces the old "procName" identity.
+    struct Allocation
+    {
+        size_t requestedSize;                  // what the caller asked for
+        std::vector<PageTableEntry> pageTable;  // this allocation's own page table
+    };
 
-    // FIFO order of frame assignment, used to pick an eviction victim.
-    // Lazily cleaned: an index here may already have been freed elsewhere,
-    // in which case it's just skipped when popped.
+    size_t   frameSize;
+    int      numFrames;
+
+    std::vector<bool> frameOccupied;
+    std::vector<int>  frameOwnerAllocId; // which allocation id owns frame i (-1 if free)
+
     std::queue<int> fifoFrameOrder;
 
-    // Per-process page table.
-    std::unordered_map<std::string, std::vector<PageTableEntry>> pageTables;
+    // The "handle" returned to the caller is just an allocation id, smuggled
+    // out as a void*. This is the piece that answers Q5: given that void*,
+    // we can recover the Allocation and walk its page table to find every
+    // physical frame that needs to be freed.
+    std::unordered_map<intptr_t, Allocation> allocations;
+    intptr_t nextAllocId = 1;
+    std::unordered_map<std::string, intptr_t> nameToAllocId;
 
-    // Simulated backing store: procName+pageIndex -> "on disk" marker.
-    // We don't store real page bytes (this is a simulator), just the fact
-    // that this page currently lives on the backing store rather than in a frame.
-    std::unordered_set<std::string> backingStore;
-    std::ofstream backingStoreLog;
-
-    uint64_t pagesPagedIn = 0;
-    uint64_t pagesPagedOut = 0;
+    // Statistics
+    std::atomic<int> pagesPagedIn{0};
+    std::atomic<int> pagesPagedOut{0};
 
     std::mutex mtx;
 
-    static std::string key(const std::string& procName, int pageIndex) {
-        return procName + "#" + std::to_string(pageIndex);
-    }
-
-    // Finds a free frame, or -1 if none exist right now.
-    int findFreeFrame() {
+    int findFreeFrame()
+    {
         for (int i = 0; i < numFrames; i++)
             if (!frameOccupied[i]) return i;
         return -1;
     }
 
-    // Evicts exactly one frame (FIFO) to the backing store, freeing it up.
-    // Returns true if a frame was evicted, false if there was nothing to evict
-    // (e.g. every frame is already free, which shouldn't happen if this is
-    // only called when findFreeFrame() fails, but we guard anyway).
-    bool evictVictim() {
-        while (!fifoFrameOrder.empty()) {
+    // FIFO eviction: pick the oldest-assigned frame, write its page out to
+    // the (simulated) backing store, and free the frame for reuse.
+    bool evictVictim()
+    {
+        while (!fifoFrameOrder.empty())
+        {
             int frame = fifoFrameOrder.front();
             fifoFrameOrder.pop();
 
             if (!frameOccupied[frame]) continue; // stale entry, already freed
 
-            std::string owner = frameOwner[frame];
-            auto& table = pageTables[owner];
+            intptr_t ownerId = frameOwnerAllocId[frame];
+            auto& table = allocations[ownerId].pageTable;
 
-            // Find which page of `owner` maps to this frame.
-            for (int p = 0; p < (int)table.size(); p++) {
-                if (table[p].valid && table[p].frameNumber == frame) {
-                    // "Write" the page out to the backing store.
-                    backingStore.insert(key(owner, p));
-                    if (backingStoreLog.is_open()) {
-                        backingStoreLog << getCurrentTimestamp() << " OUT "
-                                         << owner << " page " << p
-                                         << " (was frame " << frame << ")\n";
-                        backingStoreLog.flush();
-                    }
-                    table[p].valid = false;
-                    table[p].frameNumber = -1;
-                    table[p].everSwappedOut = true;
-                    pagesPagedOut++;
+            for (auto& pte : table)
+            {
+                if (pte.valid && pte.frameNumber == frame)
+                {
+                    // Backing store write would happen here (omitted: this
+                    // is a simulator, we don't persist real bytes).
+                    pte.valid = false;
+                    pte.frameNumber = -1;
+                    pte.everSwappedOut = true;
 
                     frameOccupied[frame] = false;
-                    frameOwner[frame] = "";
+                    frameOwnerAllocId[frame] = -1;
                     return true;
                 }
             }
@@ -101,181 +89,145 @@ private:
         return false;
     }
 
-    static std::string getCurrentTimestamp() {
-        auto now = std::chrono::system_clock::now();
-        std::time_t t = std::chrono::system_clock::to_time_t(now);
-        std::tm tm_info;
-#ifdef _WIN32
-        localtime_s(&tm_info, &t);
-#else
-        std::tm* tmp = std::localtime(&t);
-        if (tmp) tm_info = *tmp;
-#endif
-        std::ostringstream oss;
-        oss << "(" << std::setfill('0')
-            << std::setw(2) << (tm_info.tm_mon + 1) << "/"
-            << std::setw(2) << tm_info.tm_mday << "/"
-            << (tm_info.tm_year + 1900) << " "
-            << std::setw(2) << tm_info.tm_hour << ":"
-            << std::setw(2) << tm_info.tm_min << ":"
-            << std::setw(2) << tm_info.tm_sec;
-        oss << (tm_info.tm_hour < 12 ? "AM)" : "PM)");
-        return oss.str();
-    }
-
 public:
-    PagingAllocator(uint32_t totalMem, uint32_t memPerProc, uint32_t frameSize)
-        : totalMem(totalMem), memPerProc(memPerProc), frameSize(frameSize) {
+    PagingAllocator(size_t totalMem, size_t /*memPerProc*/, size_t frameSize)
+        : frameSize(frameSize)
+    {
+        memoryAllocatorType = PAGING;
+        maximumSize = totalMem;
+        currentAllocatedSize = 0;
+
         numFrames = static_cast<int>(totalMem / frameSize);
-        pagesPerProc = static_cast<int>((memPerProc + frameSize - 1) / frameSize); // ceil
         frameOccupied.assign(numFrames, false);
-        frameOwner.assign(numFrames, "");
-
-        backingStoreLog.open("csopesy-backing-store.txt", std::ios::app);
+        frameOwnerAllocId.assign(numFrames, -1);
     }
 
-    ~PagingAllocator() {
-        if (backingStoreLog.is_open()) backingStoreLog.close();
-    }
-
-    // Allocates pagesPerProc frames for procName, evicting victims via FIFO
-    // if memory is full. Returns false only if the process could never fit
-    // even with the entire machine to itself (pagesPerProc > numFrames).
-    bool allocate(const std::string& procName, uint32_t& startAddr) override {
+    // --- Q2: allocate ---
+    // size is in bytes; we round up to whole frames (this is exactly where
+    // internal fragmentation is introduced — see Q6).
+    void* allocate(size_t size) override
+    {
         std::lock_guard<std::mutex> lock(mtx);
 
-        if (pageTables.count(procName)) {
-            // Already allocated; treat as success (idempotent).
-            startAddr = 0;
-            return true;
-        }
-        if (pagesPerProc > numFrames) {
-            return false; // can never fit, regardless of eviction
-        }
+        int pagesNeeded = static_cast<int>((size + frameSize - 1) / frameSize); // ceil
+        if (pagesNeeded > numFrames)
+            return nullptr; // can never fit, even with the whole machine free
 
-        std::vector<PageTableEntry> table(pagesPerProc);
+        Allocation alloc;
+        alloc.requestedSize = size;
+        alloc.pageTable.resize(pagesNeeded);
 
-        for (int p = 0; p < pagesPerProc; p++) {
+        for (int p = 0; p < pagesNeeded; p++)
+        {
             int frame = findFreeFrame();
-            if (frame == -1) {
-                if (!evictVictim()) {
-                    // Nothing left to evict but still no free frame: bail out
-                    // and undo the partial allocation so we don't leak frames.
-                    for (int q = 0; q < p; q++) {
-                        frameOccupied[table[q].frameNumber] = false;
-                        frameOwner[table[q].frameNumber] = "";
+            if (frame == -1)
+            {
+                if (!evictVictim())
+                {
+                    // Roll back the frames we already claimed this call.
+                    for (int q = 0; q < p; q++)
+                    {
+                        int f = alloc.pageTable[q].frameNumber;
+                        frameOccupied[f] = false;
+                        frameOwnerAllocId[f] = -1;
                     }
-                    return false;
+                    return nullptr;
                 }
                 frame = findFreeFrame();
             }
 
             frameOccupied[frame] = true;
-            frameOwner[frame] = procName;
             fifoFrameOrder.push(frame);
-
-            table[p].valid = true;
-            table[p].frameNumber = frame;
-
-            // Only counts as a "page-in" if this page previously existed on
-            // the backing store (i.e. it's a reload, not a first-time load).
-            std::string k = key(procName, p);
-            if (backingStore.count(k)) {
-                backingStore.erase(k);
-                pagesPagedIn++;
-                if (backingStoreLog.is_open()) {
-                    backingStoreLog << getCurrentTimestamp() << " IN  "
-                                     << procName << " page " << p
-                                     << " (into frame " << frame << ")\n";
-                    backingStoreLog.flush();
-                }
-            }
+            alloc.pageTable[p].valid = true;
+            alloc.pageTable[p].frameNumber = frame;
         }
 
-        pageTables[procName] = std::move(table);
-        startAddr = 0; // no real virtual addressing modeled yet; presence is what matters
-        return true;
+        intptr_t id = nextAllocId++;
+        for (auto& pte : alloc.pageTable)
+            frameOwnerAllocId[pte.frameNumber] = static_cast<int>(id);
+
+        allocations[id] = std::move(alloc);
+        currentAllocatedSize += static_cast<size_t>(pagesNeeded) * frameSize;
+
+        // The handle we hand back to the caller IS the allocation id,
+        // reinterpreted as a pointer. It carries no real address meaning —
+        // it's just a lookup key we can reverse in deallocate().
+        return reinterpret_cast<void*>(id);
     }
 
-    void free(const std::string& procName) override {
+    // --- Q5: deallocate, i.e. void* -> PTE/frame mapping ---
+    void deallocate(void* ptr) override
+    {
         std::lock_guard<std::mutex> lock(mtx);
-        auto it = pageTables.find(procName);
-        if (it == pageTables.end()) return;
 
-        for (auto& pte : it->second) {
-            if (pte.valid) {
+        intptr_t id = reinterpret_cast<intptr_t>(ptr);
+        auto it = allocations.find(id);
+        if (it == allocations.end())
+            return; // unknown/already-freed handle
+
+        Allocation& alloc = it->second;
+
+        // Walk every PTE this allocation owns and free the backing frame.
+        for (auto& pte : alloc.pageTable)
+        {
+            if (pte.valid)
+            {
                 frameOccupied[pte.frameNumber] = false;
-                frameOwner[pte.frameNumber] = "";
+                frameOwnerAllocId[pte.frameNumber] = -1;
             }
+            // (a page currently swapped out has no frame to free — nothing
+            // to do for it beyond dropping the PTE itself)
         }
-        // Also drop any pages of this process still sitting in the backing store.
-        for (int p = 0; p < (int)it->second.size(); p++)
-            backingStore.erase(key(procName, p));
 
-        pageTables.erase(it);
+        currentAllocatedSize -= static_cast<size_t>(alloc.pageTable.size()) * frameSize;
+        allocations.erase(it);
     }
 
-    bool isAllocated(const std::string& procName) override {
-        std::lock_guard<std::mutex> lock(mtx);
-        return pageTables.count(procName) > 0;
-    }
-
-    int processesInMemory() override {
-        std::lock_guard<std::mutex> lock(mtx);
-        return static_cast<int>(pageTables.size());
-    }
-
-    // Paging has no external fragmentation by design: any free frame can
-    // satisfy any request, so there's never a "gap too small to use."
-    uint32_t externalFragmentation() override {
-        return 0;
-    }
-
-    // Internal fragmentation: the wasted tail of each process's last page.
-    // Not part of IMemoryAllocator, but handy for report-util.
-    uint32_t internalFragmentation() {
-        std::lock_guard<std::mutex> lock(mtx);
-        uint32_t waste = 0;
-        uint32_t remainder = memPerProc % frameSize;
-        if (remainder != 0) {
-            uint32_t perProcWaste = frameSize - remainder;
-            waste = static_cast<uint32_t>(pageTables.size()) * perProcWaste;
+    void writeSnapshot(uint64_t quantumCounter)
+    {
+        std::ostringstream fname;
+        fname << "mem-snap-" << quantumCounter << ".txt";
+        std::ofstream out(fname.str());
+        if (out.is_open()) {
+            out << visualizeMemory();
+            out.close();
         }
-        return waste;
     }
 
-    uint64_t getPagesPagedIn() {
+    int processesInMemory()
+    {
         std::lock_guard<std::mutex> lock(mtx);
-        return pagesPagedIn;
+        return static_cast<int>(nameToAllocId.size());
     }
 
-    uint64_t getPagesPagedOut() {
+    size_t externalFragmentation() { return 0; }
+
+    int getPagesPagedIn() { return pagesPagedIn.load(); }
+    int getPagesPagedOut() { return pagesPagedOut.load(); }
+
+    size_t internalFragmentation()
+    {
         std::lock_guard<std::mutex> lock(mtx);
-        return pagesPagedOut;
+        size_t total = 0;
+        for (auto& kv : allocations) {
+            const Allocation& a = kv.second;
+            size_t allocated = a.pageTable.size() * frameSize;
+            if (allocated > a.requestedSize) total += (allocated - a.requestedSize);
+        }
+        return total;
     }
 
-    // Writes memory_stamp_<qq>.txt as a per-frame map instead of the
-    // per-block map the flat allocator uses, since frames (not contiguous
-    // blocks) are the unit of allocation under paging.
-    void writeSnapshot(uint64_t quantumCycle) override {
+    String visualizeMemory() override
+    {
         std::lock_guard<std::mutex> lock(mtx);
-
-        std::string filename = "memory_stamp_" + std::to_string(quantumCycle) + ".txt";
-        std::ofstream out(filename);
-        if (!out.is_open()) return;
-
-        out << "Timestamp: " << getCurrentTimestamp() << "\n";
-        out << "Number of processes in memory: " << pageTables.size() << "\n";
-        out << "Frame size: " << frameSize << "  Total frames: " << numFrames << "\n";
-        out << "Pages paged in: " << pagesPagedIn
-            << "  Pages paged out: " << pagesPagedOut << "\n\n";
-
-        out << "Frame table (frame -> owner):\n";
-        for (int i = 0; i < numFrames; i++) {
+        std::ostringstream out;
+        out << "Frames: " << numFrames << " (frame size " << frameSize << " bytes)\n";
+        for (int i = 0; i < numFrames; i++)
+        {
             out << "  [" << i << "] "
-                << (frameOccupied[i] ? frameOwner[i] : std::string("free"))
+                << (frameOccupied[i] ? ("alloc#" + std::to_string(frameOwnerAllocId[i])) : "free")
                 << "\n";
         }
-        out.close();
+        return out.str();
     }
 };

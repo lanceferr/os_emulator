@@ -1,194 +1,162 @@
+// MemoryAllocator.h
 #pragma once
 #include "IMemoryAllocator.h"
-#include <string>
 #include <vector>
 #include <mutex>
-#include <fstream>
 #include <sstream>
-#include <iomanip>
-#include <chrono>
-#include <ctime>
 #include <algorithm>
+#include <unordered_map>
 
-// Represents one allocated block in memory.
-struct MemBlock {
-    uint32_t start;      // inclusive byte address
-    uint32_t end;        // inclusive byte address (start + memPerProc - 1)
-    std::string procName;
-};
-
-class MemoryAllocator : public IMemoryAllocator {
+class MemoryAllocator : public IMemoryAllocator
+{
 private:
-    uint32_t totalMem;
-    uint32_t memPerProc;
-    uint32_t memPerFrame;
-    std::vector<MemBlock> blocks; // sorted by start address
+    std::vector<MemoryBlock> blocks; // kept sorted by start; MemoryBlock IS used here
+    std::unordered_map<intptr_t, size_t> handleToStart; // void* handle -> block start
+    intptr_t nextHandle = 1;
     std::mutex mtx;
+    std::unordered_map<std::string, intptr_t> nameToHandle; // process name -> handle
+    size_t memPerProc = 0;
 
 public:
-    MemoryAllocator(uint32_t totalMem, uint32_t memPerProc, uint32_t memPerFrame)
-        : totalMem(totalMem), memPerProc(memPerProc), memPerFrame(memPerFrame) {
+    MemoryAllocator(size_t totalMem, size_t memPerProc, size_t /*memPerFrame*/)
+    {
+        memoryAllocatorType = FLAT_MEMORY_ALLOCATOR;
+        maximumSize = totalMem;
+        currentAllocatedSize = 0;
+        this->memPerProc = memPerProc;
     }
 
-    // Attempts to allocate memPerProc bytes using first-fit.
-    // Returns true and sets startAddr on success; returns false if memory is full.
-    bool allocate(const std::string& procName, uint32_t& startAddr) override {
+    // First-fit contiguous allocation.
+    void* allocate(size_t size) override
+    {
         std::lock_guard<std::mutex> lock(mtx);
 
-        // Build candidate start positions: 0, then right after each existing block.
-        std::vector<uint32_t> candidates;
-        candidates.push_back(0);
+        std::sort(blocks.begin(), blocks.end()); // uses MemoryBlock::operator<
+
+        std::vector<size_t> candidates{ 0 };
         for (auto& b : blocks)
-            candidates.push_back(b.end + 1);
+            candidates.push_back(b.start + b.size);
 
-        // Sort blocks by start for first-fit scanning.
-        std::sort(blocks.begin(), blocks.end(),
-            [](const MemBlock& a, const MemBlock& b) { return a.start < b.start; });
+        for (size_t candidateStart : candidates)
+        {
+            size_t candidateEnd = candidateStart + size;
+            if (candidateEnd > maximumSize) break;
 
-        for (uint32_t candidate : candidates) {
-            uint32_t end = candidate + memPerProc - 1;
-            if (end >= totalMem) break; // won't fit
-
-            // Check candidate range [candidate, end] doesn't overlap any block.
             bool fits = true;
-            for (auto& b : blocks) {
-                // Overlap if not (end < b.start || candidate > b.end)
-                if (!(end < b.start || candidate > b.end)) {
+            for (auto& b : blocks)
+            {
+                size_t bEnd = b.start + b.size;
+                if (!(candidateEnd <= b.start || candidateStart >= bEnd))
+                {
                     fits = false;
                     break;
                 }
             }
-            if (fits) {
-                blocks.push_back({ candidate, end, procName });
-                // Re-sort after insert to keep order.
-                std::sort(blocks.begin(), blocks.end(),
-                    [](const MemBlock& a, const MemBlock& b) { return a.start < b.start; });
-                startAddr = candidate;
-                return true;
+            if (fits)
+            {
+                blocks.push_back({ candidateStart, size });
+                std::sort(blocks.begin(), blocks.end());
+
+                intptr_t handle = nextHandle++;
+                handleToStart[handle] = candidateStart;
+                currentAllocatedSize += size;
+                return reinterpret_cast<void*>(handle);
             }
         }
-        return false; // memory full
+        return nullptr; // no fit found
     }
 
-    // Releases the block held by procName.
-    void free(const std::string& procName) override{
-        std::lock_guard<std::mutex> lock(mtx);
-        blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
-            [&](const MemBlock& b) { return b.procName == procName; }),
-            blocks.end());
-    }
-
-    // Returns true if procName currently has memory allocated.
-    bool isAllocated(const std::string& procName) override{
-        std::lock_guard<std::mutex> lock(mtx);
-        for (auto& b : blocks)
-            if (b.procName == procName) return true;
-        return false;
-    }
-
-    int processesInMemory() override {
-        std::lock_guard<std::mutex> lock(mtx);
-        return static_cast<int>(blocks.size());
-    }
-
-    // Total external fragmentation: free memory that exists but is too small
-    // (< memPerProc) to satisfy a new allocation request.
-    uint32_t externalFragmentation() override {
+    void deallocate(void* ptr) override
+    {
         std::lock_guard<std::mutex> lock(mtx);
 
-        // Collect all free gaps.
-        std::vector<uint32_t> gaps;
-        uint32_t prev = 0;
-        for (auto& b : blocks) {
-            if (b.start > prev)
-                gaps.push_back(b.start - prev);
-            prev = b.end + 1;
+        intptr_t handle = reinterpret_cast<intptr_t>(ptr);
+        auto it = handleToStart.find(handle);
+        if (it == handleToStart.end()) return;
+
+        size_t start = it->second;
+        auto blockIt = std::find_if(blocks.begin(), blocks.end(),
+            [&](const MemoryBlock& b) { return b.start == start; });
+        if (blockIt != blocks.end())
+        {
+            currentAllocatedSize -= blockIt->size;
+            blocks.erase(blockIt);
         }
-        if (prev < totalMem)
-            gaps.push_back(totalMem - prev);
-
-        // External fragmentation = free gaps that are smaller than memPerProc.
-        uint32_t frag = 0;
-        for (uint32_t g : gaps)
-            if (g < memPerProc) frag += g;
-        return frag;
+        handleToStart.erase(it);
     }
 
-    static std::string getCurrentTimestamp() {
-        auto now = std::chrono::system_clock::now();
-        std::time_t t = std::chrono::system_clock::to_time_t(now);
-        std::tm tm_info;
-#ifdef _WIN32
-        localtime_s(&tm_info, &t);
-#else
-        std::tm* tmp = std::localtime(&t);
-        if (tmp) tm_info = *tmp;
-#endif
-        std::ostringstream oss;
-        oss << "(" << std::setfill('0')
-            << std::setw(2) << (tm_info.tm_mon + 1) << "/"
-            << std::setw(2) << tm_info.tm_mday << "/"
-            << (tm_info.tm_year + 1900) << " "
-            << std::setw(2) << tm_info.tm_hour << ":"
-            << std::setw(2) << tm_info.tm_min << ":"
-            << std::setw(2) << tm_info.tm_sec;
-        oss << (tm_info.tm_hour < 12 ? "AM)" : "PM)");
-        return oss.str();
+    // Snapshot: write a simple textual dump to mem-snap-<quantum>.txt
+    void writeSnapshot(uint64_t quantumCounter)
+    {
+        std::ostringstream fname;
+        fname << "mem-snap-" << quantumCounter << ".txt";
+        std::ofstream out(fname.str());
+        if (out.is_open()) {
+            out << visualizeMemory();
+            out.close();
+        }
     }
 
-    // Writes memory_stamp_<qq>.txt per the spec's ASCII layout.
-    // Format (top = high address, bottom = low address):
-    //   Timestamp: ...
-    //   Number of processes in memory: N
-    //   Total external fragmentation in KB: F
-    //
-    //   ----end---- = <totalMem>
-    //   <upper addr of topmost block>
-    //   <procName>
-    //   <lower addr of topmost block>
-    //   ...
-    //   ----start----- = 0
-    void writeSnapshot(uint64_t quantumCycle) override{
+    int processesInMemory()
+    {
         std::lock_guard<std::mutex> lock(mtx);
+        return static_cast<int>(nameToHandle.size());
+    }
 
-        std::string filename = "memory_stamp_" +
-            std::to_string(quantumCycle) + ".txt";
-        std::ofstream out(filename);
-        if (!out.is_open()) return;
-
-        // Header
-        out << "Timestamp: " << getCurrentTimestamp() << "\n";
-        out << "Number of processes in memory: " << blocks.size() << "\n";
-
-        // Fragmentation (compute without locking since we hold the lock already)
-        uint32_t prev = 0;
-        uint32_t frag = 0;
+    size_t externalFragmentation()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (blocks.empty()) return maximumSize;
+        std::sort(blocks.begin(), blocks.end());
+        size_t largestFree = 0;
+        size_t prevEnd = 0;
         for (auto& b : blocks) {
-            if (b.start > prev) {
-                uint32_t gap = b.start - prev;
-                if (gap < memPerProc) frag += gap;
+            if (b.start > prevEnd) {
+                size_t gap = b.start - prevEnd;
+                if (gap > largestFree) largestFree = gap;
             }
-            prev = b.end + 1;
+            prevEnd = b.start + b.size;
         }
-        if (prev < totalMem) {
-            uint32_t gap = totalMem - prev;
-            if (gap < memPerProc) frag += gap;
+        if (prevEnd < maximumSize) {
+            size_t gap = maximumSize - prevEnd;
+            if (gap > largestFree) largestFree = gap;
         }
-        out << "Total external fragmentation in KB: " << (frag / 1024) << "\n\n";
+        size_t totalFree = maximumSize - currentAllocatedSize;
+        if (totalFree <= largestFree) return 0;
+        return totalFree - largestFree;
+    }
 
-        // ASCII memory map, top (high address) to bottom (low address)
-        out << "----end---- = " << totalMem << "\n";
+    // Optional: track allocation by process name (not used by Scheduler now)
+    bool allocateForProcess(const std::string& procName)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (nameToHandle.find(procName) != nameToHandle.end()) return false;
+        void* h = allocate(memPerProc);
+        if (!h) return false;
+        intptr_t handle = reinterpret_cast<intptr_t>(h);
+        nameToHandle[procName] = handle;
+        return true;
+    }
 
-        // Print blocks from highest to lowest
-        for (int i = static_cast<int>(blocks.size()) - 1; i >= 0; i--) {
-            auto& b = blocks[i];
-            out << b.end + 1 << "\n";
-            out << b.procName << "\n";
-            out << b.start << "\n";
-        }
+    void freeProcess(const std::string& procName)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = nameToHandle.find(procName);
+        if (it == nameToHandle.end()) return;
+        intptr_t handle = it->second;
+        nameToHandle.erase(it);
+        deallocate(reinterpret_cast<void*>(handle));
+    }
 
+    String visualizeMemory() override
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::sort(blocks.begin(), blocks.end());
+        std::ostringstream out;
+        out << "----end---- = " << maximumSize << "\n";
+        for (auto it = blocks.rbegin(); it != blocks.rend(); ++it)
+            out << (it->start + it->size) << "\n" << it->start << "\n";
         out << "----start----- = 0\n";
-        out.close();
+        return out.str();
     }
 };
-#pragma once

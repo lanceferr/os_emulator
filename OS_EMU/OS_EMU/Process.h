@@ -57,12 +57,15 @@ public:
 
     // Memory allocation (Week 10): base address assigned by MemoryAllocator (-1 = not yet allocated)
     int memStartAddr;
+    // Opaque handle returned by IMemoryAllocator::allocate
+    void* memHandle;
 
     Process(const std::string& name, int pid, std::vector<Instruction> programIn, int totalFlatCount)
         : name(name), pid(pid), state(ProcessState::READY), coreId(-1),
         instructionsExecuted(0), totalInstructions(totalFlatCount),
         sleepTicksRemaining(0), memStartAddr(-1) {
         program = std::move(programIn);
+        memHandle = nullptr;
         createdAt = getCurrentTimestamp();
         execStack.push_back({ &program, 0, 0 });
     }

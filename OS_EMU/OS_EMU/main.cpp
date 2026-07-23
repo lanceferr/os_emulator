@@ -19,6 +19,7 @@
 #include "IMemoryAllocator.h"
 #include "MemoryAllocator.h"
 #include "PagingAllocator.h"
+// Include concrete allocator headers so dynamic_cast<...> works at this translation unit.
 
 static int pidCounter = 1;
 static Config config;
@@ -127,13 +128,19 @@ static std::string buildUtilReport() {
     // only to decide which extra stats to print; both schemes are reached
     // through the same IMemoryAllocator interface for everything else.
     if (memAlloc) {
-        oss << "Memory: " << memAlloc->processesInMemory() << " process(es) allocated, "
-            << memAlloc->externalFragmentation() << " bytes external fragmentation\n";
-
-        if (auto* paging = dynamic_cast<PagingAllocator*>(memAlloc.get())) {
+        if (auto* flat = dynamic_cast<MemoryAllocator*>(memAlloc.get())) {
+            oss << "Memory: " << flat->processesInMemory() << " process(es) allocated, "
+                << flat->externalFragmentation() << " bytes external fragmentation\n";
+        }
+        else if (auto* paging = dynamic_cast<PagingAllocator*>(memAlloc.get())) {
+            oss << "Memory: " << paging->processesInMemory() << " process(es) allocated, "
+                << paging->externalFragmentation() << " bytes external fragmentation\n";
             oss << "Paging: " << paging->getPagesPagedIn() << " pages paged in, "
                 << paging->getPagesPagedOut() << " pages paged out, "
                 << paging->internalFragmentation() << " bytes internal fragmentation\n";
+        }
+        else {
+            oss << memAlloc->visualizeMemory() << "\n";
         }
         oss << "----------------------------------------------\n";
     }
@@ -314,7 +321,7 @@ int main() {
                         std::cout << "Memory allocator: flat/first-fit, " << config.maxOverallMem
                             << " bytes total, " << config.memPerProc << " bytes per process.\n";
                     }
-                    scheduler->setMemoryAllocator(memAlloc.get());
+                    scheduler->setMemoryAllocator(memAlloc.get(), config.memPerProc);
                 }
 
                 scheduler->start();
