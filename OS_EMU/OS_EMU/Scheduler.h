@@ -1,7 +1,7 @@
 #pragma once
 #include "Process.h"
 #include "Config.h"
-#include "MemoryAllocator.h"
+#include "IMemoryAllocator.h"
 #include <queue>
 #include <vector>
 #include <thread>
@@ -40,8 +40,9 @@ private:
     std::atomic<bool> running;
     std::atomic<uint64_t> cpuTicks;
 
-    // Memory manager (Week 10)
-    MemoryAllocator* memAlloc = nullptr; // optional; null = no memory management
+    // Memory manager (Week 10): depends on the interface only, so the
+    // concrete scheme (flat/first-fit vs. paging) is swappable via config.
+    IMemoryAllocator* memAlloc = nullptr; // optional; null = no memory management
     std::atomic<uint64_t> quantumCounter; // how many full quantums have elapsed across all cores
 
 public:
@@ -72,8 +73,12 @@ public:
         workerThreads.clear();
     }
 
-    void setMemoryAllocator(MemoryAllocator* alloc) {
+    void setMemoryAllocator(IMemoryAllocator* alloc) {
         memAlloc = alloc;
+    }
+
+    IMemoryAllocator* getMemoryAllocator() const {
+        return memAlloc;
     }
 
     void addProcess(std::shared_ptr<Process> process) {

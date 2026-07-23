@@ -6,6 +6,7 @@
 #include <cstdint>
 
 enum class SchedulerType { FCFS, RR };
+enum class MemScheme { FLAT, PAGING };
 
 struct Config {
     int numCPU = 4;
@@ -20,6 +21,7 @@ struct Config {
     uint32_t maxOverallMem = 16384;
     uint32_t memPerFrame = 16;
     uint32_t memPerProc = 4096;
+    MemScheme memScheme = MemScheme::FLAT; // "flat" (first-fit) or "paging"
 
     bool loaded = false;
 };
@@ -87,6 +89,17 @@ public:
             else if (key == "mem-per-proc") {
                 long v; file >> v;
                 out.memPerProc = static_cast<uint32_t>(v);
+            }
+            else if (key == "mem-scheme") {
+                std::string v; file >> v;
+                if (!v.empty() && v.front() == '"') v.erase(0, 1);
+                if (!v.empty() && v.back() == '"') v.pop_back();
+                if (v == "paging") out.memScheme = MemScheme::PAGING;
+                else if (v == "flat") out.memScheme = MemScheme::FLAT;
+                else {
+                    std::cout << "Error: mem-scheme must be 'flat' or 'paging'.\n";
+                    return false;
+                }
             }
             else {
                 // Unknown key: skip its value token and continue (forward-compatible)

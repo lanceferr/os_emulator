@@ -16,12 +16,14 @@
 #include "Scheduler.h"
 #include "Config.h"
 #include "InstructionGenerator.h"
+#include "IMemoryAllocator.h"
 #include "MemoryAllocator.h"
+#include "PagingAllocator.h"
 
 static int pidCounter = 1;
 static Config config;
 static std::unique_ptr<Scheduler> scheduler;
-static std::unique_ptr<MemoryAllocator> memAlloc;
+static std::unique_ptr<IMemoryAllocator> memAlloc;
 static InstructionGenerator insGen;
 
 // Switchable instruction generation mode, controlled by the "gen-mode" command.
@@ -120,6 +122,22 @@ static std::string buildUtilReport() {
         }
     }
     oss << "----------------------------------------------\n";
+
+    // Memory manager summary, if attached. Branches on the concrete scheme
+    // only to decide which extra stats to print; both schemes are reached
+    // through the same IMemoryAllocator interface for everything else.
+    if (memAlloc) {
+        oss << "Memory: " << memAlloc->processesInMemory() << " process(es) allocated, "
+            << memAlloc->externalFragmentation() << " bytes external fragmentation\n";
+
+        if (auto* paging = dynamic_cast<PagingAllocator*>(memAlloc.get())) {
+            oss << "Paging: " << paging->getPagesPagedIn() << " pages paged in, "
+                << paging->getPagesPagedOut() << " pages paged out, "
+                << paging->internalFragmentation() << " bytes internal fragmentation\n";
+        }
+        oss << "----------------------------------------------\n";
+    }
+
     return oss.str();
 }
 
@@ -280,13 +298,23 @@ int main() {
                 scheduler = std::make_unique<Scheduler>(
                     config.numCPU, config.scheduler, config.quantumCycles, config.delaysPerExec);
 
-                // Attach memory allocator if memory config is present
+                // Attach a memory allocator if memory config is present. The
+                // concrete scheme (flat/first-fit vs. paging) is chosen by
+                // config.memScheme; Scheduler only ever sees IMemoryAllocator.
                 if (config.maxOverallMem > 0 && config.memPerProc > 0) {
-                    memAlloc = std::make_unique<MemoryAllocator>(
-                        config.maxOverallMem, config.memPerProc, config.memPerFrame);
+                    if (config.memScheme == MemScheme::PAGING) {
+                        memAlloc = std::make_unique<PagingAllocator>(
+                            config.maxOverallMem, config.memPerProc, config.memPerFrame);
+                        std::cout << "Memory allocator: paging, " << config.maxOverallMem
+                            << " bytes total, " << config.memPerFrame << " bytes per frame.\n";
+                    }
+                    else {
+                        memAlloc = std::make_unique<MemoryAllocator>(
+                            config.maxOverallMem, config.memPerProc, config.memPerFrame);
+                        std::cout << "Memory allocator: flat/first-fit, " << config.maxOverallMem
+                            << " bytes total, " << config.memPerProc << " bytes per process.\n";
+                    }
                     scheduler->setMemoryAllocator(memAlloc.get());
-                    std::cout << "Memory allocator: " << config.maxOverallMem << " bytes total, "
-                        << config.memPerProc << " bytes per process.\n";
                 }
 
                 scheduler->start();

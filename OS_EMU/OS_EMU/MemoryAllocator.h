@@ -1,4 +1,5 @@
 #pragma once
+#include "IMemoryAllocator.h"
 #include <string>
 #include <vector>
 #include <mutex>
@@ -16,7 +17,7 @@ struct MemBlock {
     std::string procName;
 };
 
-class MemoryAllocator {
+class MemoryAllocator : public IMemoryAllocator {
 private:
     uint32_t totalMem;
     uint32_t memPerProc;
@@ -31,7 +32,7 @@ public:
 
     // Attempts to allocate memPerProc bytes using first-fit.
     // Returns true and sets startAddr on success; returns false if memory is full.
-    bool allocate(const std::string& procName, uint32_t& startAddr) {
+    bool allocate(const std::string& procName, uint32_t& startAddr) override {
         std::lock_guard<std::mutex> lock(mtx);
 
         // Build candidate start positions: 0, then right after each existing block.
@@ -70,7 +71,7 @@ public:
     }
 
     // Releases the block held by procName.
-    void free(const std::string& procName) {
+    void free(const std::string& procName) override{
         std::lock_guard<std::mutex> lock(mtx);
         blocks.erase(std::remove_if(blocks.begin(), blocks.end(),
             [&](const MemBlock& b) { return b.procName == procName; }),
@@ -78,21 +79,21 @@ public:
     }
 
     // Returns true if procName currently has memory allocated.
-    bool isAllocated(const std::string& procName) {
+    bool isAllocated(const std::string& procName) override{
         std::lock_guard<std::mutex> lock(mtx);
         for (auto& b : blocks)
             if (b.procName == procName) return true;
         return false;
     }
 
-    int processesInMemory() {
+    int processesInMemory() override {
         std::lock_guard<std::mutex> lock(mtx);
         return static_cast<int>(blocks.size());
     }
 
     // Total external fragmentation: free memory that exists but is too small
     // (< memPerProc) to satisfy a new allocation request.
-    uint32_t externalFragmentation() {
+    uint32_t externalFragmentation() override {
         std::lock_guard<std::mutex> lock(mtx);
 
         // Collect all free gaps.
@@ -147,7 +148,7 @@ public:
     //   <lower addr of topmost block>
     //   ...
     //   ----start----- = 0
-    void writeSnapshot(uint64_t quantumCycle) {
+    void writeSnapshot(uint64_t quantumCycle) override{
         std::lock_guard<std::mutex> lock(mtx);
 
         std::string filename = "memory_stamp_" +
