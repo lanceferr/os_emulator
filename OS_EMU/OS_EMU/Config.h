@@ -17,14 +17,23 @@ struct Config {
     uint32_t maxIns = 1;
     uint32_t delaysPerExec = 0;
 
-    // Memory manager (Week 10)
+    // Memory manager (Week 10 + MO2)
     uint32_t maxOverallMem = 16384;
     uint32_t memPerFrame = 16;
-    uint32_t memPerProc = 4096;
+    // MO2: memory given to scheduler-generated processes is rolled between
+    // these two (both must be a power of two in [2^6, 2^16]).
+    uint32_t minMemPerProc = 4096;
+    uint32_t maxMemPerProc = 4096;
     MemScheme memScheme = MemScheme::FLAT; // "flat" (first-fit) or "paging"
 
     bool loaded = false;
 };
+
+// MO2: all process/frame memory sizes must be a power of two in [2^6, 2^16] bytes.
+inline bool isValidMemSize(long long v) {
+    if (v < 64 || v > 65536) return false;
+    return (v & (v - 1)) == 0;
+}
 
 class ConfigLoader {
 public:
@@ -87,8 +96,30 @@ public:
                 out.memPerFrame = static_cast<uint32_t>(v);
             }
             else if (key == "mem-per-proc") {
+                // Backward-compat single value: treat as min == max.
                 long v; file >> v;
-                out.memPerProc = static_cast<uint32_t>(v);
+                if (!isValidMemSize(v)) {
+                    std::cout << "Error: mem-per-proc must be a power of two in [64, 65536].\n";
+                    return false;
+                }
+                out.minMemPerProc = static_cast<uint32_t>(v);
+                out.maxMemPerProc = static_cast<uint32_t>(v);
+            }
+            else if (key == "min-mem-per-proc") {
+                long v; file >> v;
+                if (!isValidMemSize(v)) {
+                    std::cout << "Error: min-mem-per-proc must be a power of two in [64, 65536].\n";
+                    return false;
+                }
+                out.minMemPerProc = static_cast<uint32_t>(v);
+            }
+            else if (key == "max-mem-per-proc") {
+                long v; file >> v;
+                if (!isValidMemSize(v)) {
+                    std::cout << "Error: max-mem-per-proc must be a power of two in [64, 65536].\n";
+                    return false;
+                }
+                out.maxMemPerProc = static_cast<uint32_t>(v);
             }
             else if (key == "mem-scheme") {
                 std::string v; file >> v;
@@ -109,6 +140,10 @@ public:
 
         if (out.minIns > out.maxIns) {
             std::cout << "Error: min-ins cannot exceed max-ins.\n";
+            return false;
+        }
+        if (out.minMemPerProc > out.maxMemPerProc) {
+            std::cout << "Error: min-mem-per-proc cannot exceed max-mem-per-proc.\n";
             return false;
         }
 

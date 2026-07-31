@@ -9,6 +9,7 @@
 #include <ctime>
 #include <cstdint>
 #include "Instruction.h"
+#include "IMemoryAllocator.h"
 
 enum class ProcessState {
     READY,
@@ -60,10 +61,33 @@ public:
     // Opaque handle returned by IMemoryAllocator::allocate
     void* memHandle;
 
-    Process(const std::string& name, int pid, std::vector<Instruction> programIn, int totalFlatCount)
+    // MO2: memory size requested via "screen -s <name> <size>" / "screen -c
+    // ... <size> ..." (or rolled between min-mem-per-proc/max-mem-per-proc
+    // for scheduler-generated processes). This is what gets passed to
+    // memAlloc->allocate() when the process is admitted to a core.
+    size_t requestedMemSize = 0;
+    // Set by the Scheduler alongside memHandle once memory is allocated, so
+    // READ/WRITE instructions can call back into the allocator directly.
+    IMemoryAllocator* memAllocRef = nullptr;
+
+    // Symbol table segment (MO2): fixed 64 bytes, so at most 32 uint16
+    // variables. Once the cap is reached, further DECLARE/auto-declare
+    // attempts are silently ignored per spec.
+    static constexpr size_t SYMBOL_TABLE_MAX_BYTES = 64;
+    static constexpr size_t SYMBOL_TABLE_MAX_VARS = SYMBOL_TABLE_MAX_BYTES / 2; // 32
+
+    // Memory access violation (MO2): set when a READ/WRITE touches an
+    // address outside this process's allocated memory. The process is
+    // force-finished at that point (see triggerMemoryViolation).
+    bool memoryViolation = false;
+    std::string violationTimestamp;
+    uint32_t violationAddress = 0;
+
+    Process(const std::string& name, int pid, std::vector<Instruction> programIn, int totalFlatCount,
+        size_t requestedMemSize = 0)
         : name(name), pid(pid), state(ProcessState::READY), coreId(-1),
         instructionsExecuted(0), totalInstructions(totalFlatCount),
-        sleepTicksRemaining(0), memStartAddr(-1) {
+        sleepTicksRemaining(0), memStartAddr(-1), requestedMemSize(requestedMemSize) {
         program = std::move(programIn);
         memHandle = nullptr;
         createdAt = getCurrentTimestamp();
@@ -93,16 +117,42 @@ public:
         return oss.str();
     }
 
+    // Spec's memory-violation message wants just <HH:MM:SS>, unlike the
+    // full "(MM/DD/YYYY HH:MM:SS AM/PM)" used for createdAt/finishedAt.
+    static std::string getCurrentTimeOnly() {
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_info;
+#ifdef _WIN32
+        localtime_s(&tm_info, &t);
+#else
+        std::tm* tmp = std::localtime(&t);
+        if (tmp) tm_info = *tmp;
+#endif
+        std::ostringstream oss;
+        oss << std::setfill('0') << std::setw(2) << tm_info.tm_hour << ":"
+            << std::setw(2) << tm_info.tm_min << ":"
+            << std::setw(2) << tm_info.tm_sec;
+        return oss.str();
+    }
+
     bool isFinished() const {
         return execStack.empty();
     }
 
-    // Resolves an operand to its value, declaring the variable with 0 first if needed
+    // Resolves an operand to its value, declaring the variable with 0 first if
+    // needed — but only if the symbol table isn't already at its 32-variable
+    // cap. If it is, the reference is ignored and treated as 0 (matches the
+    // "succeeding instructions involving variable declarations will be
+    // ignored" rule for the auto-declare case too).
     uint16_t resolve(const Operand& op) {
         if (op.isLiteral) return op.literalValue;
+        std::lock_guard<std::mutex> lock(mtx);
         auto it = variables.find(op.varName);
         if (it == variables.end()) {
-            variables[op.varName] = 0; // auto-declare with 0 per spec
+            if (variables.size() < SYMBOL_TABLE_MAX_VARS) {
+                variables[op.varName] = 0; // auto-declare with 0 per spec
+            }
             return 0;
         }
         return it->second;
@@ -180,21 +230,21 @@ private:
         }
         case InstructionType::DECLARE: {
             std::lock_guard<std::mutex> lock(mtx);
-            variables[ins.declareVar] = ins.declareValue;
+            setVariableLocked(ins.declareVar, ins.declareValue);
             break;
         }
         case InstructionType::ADD: {
             uint16_t a = resolve(ins.arithSrc1);
             uint16_t b = resolve(ins.arithSrc2);
             std::lock_guard<std::mutex> lock(mtx);
-            variables[ins.arithDest] = clampU16((int32_t)a + (int32_t)b);
+            setVariableLocked(ins.arithDest, clampU16((int32_t)a + (int32_t)b));
             break;
         }
         case InstructionType::SUBTRACT: {
             uint16_t a = resolve(ins.arithSrc1);
             uint16_t b = resolve(ins.arithSrc2);
             std::lock_guard<std::mutex> lock(mtx);
-            variables[ins.arithDest] = clampU16((int32_t)a - (int32_t)b);
+            setVariableLocked(ins.arithDest, clampU16((int32_t)a - (int32_t)b));
             break;
         }
         case InstructionType::SLEEP: {
@@ -202,8 +252,57 @@ private:
             state = ProcessState::WAITING;
             break;
         }
+        case InstructionType::READ: {
+            uint16_t value = 0;
+            bool ok = (memAllocRef != nullptr && memHandle != nullptr)
+                ? memAllocRef->readUint16(memHandle, ins.readAddress, value)
+                : false;
+            if (!ok) {
+                triggerMemoryViolation(ins.readAddress);
+                break;
+            }
+            std::lock_guard<std::mutex> lock(mtx);
+            setVariableLocked(ins.readVar, value);
+            break;
+        }
+        case InstructionType::WRITE: {
+            uint16_t value = resolve(ins.writeValue);
+            bool ok = (memAllocRef != nullptr && memHandle != nullptr)
+                ? memAllocRef->writeUint16(memHandle, ins.writeAddress, value)
+                : false;
+            if (!ok) {
+                triggerMemoryViolation(ins.writeAddress);
+            }
+            break;
+        }
         default:
             break; // FOR is handled in executeOneStep, never reaches here
         }
+    }
+
+    // Caller must hold mtx. Updates an existing variable unconditionally, or
+    // inserts a new one only if the 32-variable symbol-table cap isn't
+    // reached yet — otherwise the write is silently ignored per spec.
+    void setVariableLocked(const std::string& varName, uint16_t value) {
+        auto it = variables.find(varName);
+        if (it != variables.end()) {
+            it->second = value;
+        }
+        else if (variables.size() < SYMBOL_TABLE_MAX_VARS) {
+            variables[varName] = value;
+        }
+    }
+
+    // Access violation: outside the process's allocated memory range. Per
+    // spec this shuts the process down immediately, akin to a real memory
+    // access violation. We do that by clearing the exec stack so
+    // isFinished() reports true right away; the Scheduler then retires it
+    // through its normal "finished" path.
+    void triggerMemoryViolation(uint32_t address) {
+        std::lock_guard<std::mutex> lock(mtx);
+        memoryViolation = true;
+        violationAddress = address;
+        violationTimestamp = getCurrentTimeOnly();
+        execStack.clear();
     }
 };

@@ -47,6 +47,9 @@
     <ClInclude Include="PagingAllocator.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="InstructionParser.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Config.txt" />

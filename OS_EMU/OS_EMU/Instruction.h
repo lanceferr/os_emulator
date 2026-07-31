@@ -11,7 +11,9 @@ enum class InstructionType {
     ADD,
     SUBTRACT,
     SLEEP,
-    FOR
+    FOR,
+    READ,
+    WRITE
 };
 
 // An operand is either a literal uint16 value or a variable name.
@@ -52,4 +54,12 @@ struct Instruction {
     // FOR
     std::vector<Instruction> forBody;
     int forRepeats = 0;
+
+    // READ(var, memory_address): loads uint16 from memory_address into var
+    std::string readVar;
+    uint32_t    readAddress = 0;
+
+    // WRITE(memory_address, value): stores uint16 value at memory_address
+    uint32_t    writeAddress = 0;
+    Operand     writeValue;
 };

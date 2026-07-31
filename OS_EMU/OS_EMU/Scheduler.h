@@ -40,7 +40,8 @@ private:
 
     std::vector<std::thread> workerThreads;
     std::atomic<bool> running;
-    std::atomic<uint64_t> cpuTicks;
+    std::atomic<uint64_t> cpuTicks;      // active ticks: a core actually executing/delaying a process
+    std::atomic<uint64_t> idleCpuTicks;  // ticks where a core had no process to run
 
     // Memory manager (Week 10): depends on the interface only, so the
     // concrete scheme (flat/first-fit vs. paging) is swappable via config.
@@ -51,7 +52,7 @@ private:
 public:
     Scheduler(int numCores, SchedulerType type, uint32_t quantumCycles, uint32_t delaysPerExec)
         : numCores(numCores), type(type), quantumCycles(quantumCycles),
-        delaysPerExec(delaysPerExec), running(false), cpuTicks(0), quantumCounter(0) {
+        delaysPerExec(delaysPerExec), running(false), cpuTicks(0), idleCpuTicks(0), quantumCounter(0) {
         runningProcesses.resize(numCores, nullptr);
         quantumUsed.resize(numCores, 0);
         delayCounters.resize(numCores, 0);
@@ -123,6 +124,10 @@ public:
 
     int getNumCores() const { return numCores; }
 
+    uint64_t getActiveCpuTicks() const { return cpuTicks.load(); }
+    uint64_t getIdleCpuTicks() const { return idleCpuTicks.load(); }
+    uint64_t getTotalCpuTicks() const { return cpuTicks.load() + idleCpuTicks.load(); }
+
     int coresInUse() {
         std::lock_guard<std::mutex> lock(runningMutex);
         int busy = 0;
@@ -183,7 +188,7 @@ private:
                     return !readyQueue.empty() || !running.load();
                     });
                 if (!running.load()) break;
-                if (readyQueue.empty()) continue;
+                if (readyQueue.empty()) { idleCpuTicks++; continue; }
 
                 proc = readyQueue.front();
 
@@ -196,6 +201,7 @@ private:
                         proc->state = ProcessState::READY;
                     }
                     readyQueue.push(proc);
+                    idleCpuTicks++;
                     continue;
                 }
 
@@ -207,18 +213,21 @@ private:
                 // If memory is full, send it to the back of the ready queue
                 // (no backing store per spec) and let this core idle briefly.
                 if (memAlloc != nullptr && proc->memHandle == nullptr) {
-                    void* handle = memAlloc->allocate(memPerProc);
+                    size_t sizeToAllocate = proc->requestedMemSize > 0 ? proc->requestedMemSize : memPerProc;
+                    void* handle = memAlloc->allocate(sizeToAllocate);
                     if (!handle) {
                         // Memory full: requeue at tail, core goes idle.
                         proc->state = ProcessState::READY;
                         std::unique_lock<std::mutex> ql(queueMutex);
                         readyQueue.push(proc);
                         ql.unlock();
+                        idleCpuTicks++;
                         std::this_thread::sleep_for(std::chrono::milliseconds(20));
                         continue;
                     }
                     proc->memHandle = handle;
                     proc->memStartAddr = 0; // unknown/opaque for paging
+                    proc->memAllocRef = memAlloc; // lets Process execute READ/WRITE directly
                 }
 
                 {

@@ -6,15 +6,19 @@
 #include <sstream>
 #include <algorithm>
 #include <unordered_map>
+#include <fstream>
+#include <cstdint>
 
 class MemoryAllocator : public IMemoryAllocator
 {
 private:
-    std::vector<MemoryBlock> blocks; // kept sorted by start; MemoryBlock IS used here
-    std::unordered_map<intptr_t, size_t> handleToStart; // void* handle -> block start
+    std::vector<MemoryBlock> blocks;
+    std::unordered_map<intptr_t, size_t> handleToStart;
+    std::unordered_map<intptr_t, size_t> handleToSize;
+    std::unordered_map<intptr_t, std::vector<uint8_t>> handleToBuffer;
     intptr_t nextHandle = 1;
     std::mutex mtx;
-    std::unordered_map<std::string, intptr_t> nameToHandle; // process name -> handle
+    std::unordered_map<std::string, intptr_t> nameToHandle;
     size_t memPerProc = 0;
 
 public:
@@ -31,7 +35,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mtx);
 
-        std::sort(blocks.begin(), blocks.end()); // uses MemoryBlock::operator<
+        std::sort(blocks.begin(), blocks.end());
 
         std::vector<size_t> candidates{ 0 };
         for (auto& b : blocks)
@@ -59,11 +63,13 @@ public:
 
                 intptr_t handle = nextHandle++;
                 handleToStart[handle] = candidateStart;
+                handleToSize[handle] = size;
+                handleToBuffer[handle] = std::vector<uint8_t>(size, 0);
                 currentAllocatedSize += size;
                 return reinterpret_cast<void*>(handle);
             }
         }
-        return nullptr; // no fit found
+        return nullptr;
     }
 
     void deallocate(void* ptr) override
@@ -83,6 +89,37 @@ public:
             blocks.erase(blockIt);
         }
         handleToStart.erase(it);
+        handleToSize.erase(handle);
+        handleToBuffer.erase(handle);
+    }
+
+    // Flat scheme has no paging, so there's nothing to fault in — just a
+    // bounds check against the process's own allocated range, then a direct
+    // byte-buffer read/write.
+    bool readUint16(void* h, uint32_t address, uint16_t& outValue) override
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        intptr_t handle = reinterpret_cast<intptr_t>(h);
+        auto it = handleToBuffer.find(handle);
+        if (it == handleToBuffer.end()) return false;
+        auto& buf = it->second;
+        if (static_cast<size_t>(address) + 2 > buf.size()) return false; // out of range
+        outValue = static_cast<uint16_t>(buf[address]) |
+            (static_cast<uint16_t>(buf[address + 1]) << 8);
+        return true;
+    }
+
+    bool writeUint16(void* h, uint32_t address, uint16_t value) override
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        intptr_t handle = reinterpret_cast<intptr_t>(h);
+        auto it = handleToBuffer.find(handle);
+        if (it == handleToBuffer.end()) return false;
+        auto& buf = it->second;
+        if (static_cast<size_t>(address) + 2 > buf.size()) return false; // out of range
+        buf[address] = static_cast<uint8_t>(value & 0xFF);
+        buf[address + 1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+        return true;
     }
 
     // Snapshot: write a simple textual dump to mem-snap-<quantum>.txt

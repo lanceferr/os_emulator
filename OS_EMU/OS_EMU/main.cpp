@@ -19,6 +19,7 @@
 #include "IMemoryAllocator.h"
 #include "MemoryAllocator.h"
 #include "PagingAllocator.h"
+#include "InstructionParser.h"
 // Include concrete allocator headers so dynamic_cast<...> works at this translation unit.
 
 static int pidCounter = 1;
@@ -35,6 +36,16 @@ static std::atomic<bool> batchGenActive(false);
 static std::thread batchGenThread;
 static std::atomic<int> batchPidSeq(1);
 
+// Rolls a uniformly-random power-of-two byte size within [minSize, maxSize].
+// Both bounds are guaranteed by ConfigLoader to already be powers of two in
+// [64, 65536], so this just picks among the powers of two between them.
+static uint32_t rollPow2MemSize(uint32_t minSize, uint32_t maxSize, std::mt19937& rng) {
+    std::vector<uint32_t> options;
+    for (uint32_t v = minSize; v <= maxSize; v <<= 1) options.push_back(v);
+    if (options.empty()) return minSize;
+    return options[rng() % options.size()];
+}
+
 // Counts every instruction in a program, including FOR loop bodies expanded
 // by their repeat count. Used for progress display ("5 / N").
 static int countFlatInstructions(const std::vector<Instruction>& list) {
@@ -50,13 +61,22 @@ static int countFlatInstructions(const std::vector<Instruction>& list) {
     return total;
 }
 
-std::shared_ptr<Process> createProcess(const std::string& name, int numInstructions) {
+std::shared_ptr<Process> createProcess(const std::string& name, int numInstructions, size_t memSize) {
     std::vector<Instruction> program;
-        // Default: randomized mix of DECLARE/ADD/SUBTRACT/SLEEP/PRINT/FOR.
-        program = insGen.generate(name, numInstructions);
+    // Default: randomized mix of DECLARE/ADD/SUBTRACT/SLEEP/PRINT/FOR.
+    program = insGen.generate(name, numInstructions);
 
     int flatTotal = countFlatInstructions(program);
-    auto p = std::make_shared<Process>(name, pidCounter++, std::move(program), flatTotal);
+    auto p = std::make_shared<Process>(name, pidCounter++, std::move(program), flatTotal, memSize);
+    return p;
+}
+
+// Used by "screen -c": builds a process from a user-supplied instruction
+// string instead of the random generator.
+std::shared_ptr<Process> createProcessFromInstructions(const std::string& name,
+    std::vector<Instruction> program, size_t memSize) {
+    int flatTotal = countFlatInstructions(program);
+    auto p = std::make_shared<Process>(name, pidCounter++, std::move(program), flatTotal, memSize);
     return p;
 }
 
@@ -64,8 +84,11 @@ void printHelp() {
     std::cout << "Available commands:\n";
     std::cout << "  initialize              - Load config.txt and start the scheduler\n";
     std::cout << "  screen -ls              - List all running and finished processes\n";
-    std::cout << "  screen -s <name>        - Create a new process\n";
+    std::cout << "  screen -s <name> <size> - Create a new process with the given memory size\n";
+    std::cout << "  screen -c <name> <size> \"<instrs>\" - Create a process with explicit instructions\n";
     std::cout << "  screen -r <name>        - Reattach to an existing process\n";
+    std::cout << "  process-smi             - Summarized memory/CPU usage overview\n";
+    std::cout << "  vmstat                  - Detailed memory and CPU tick statistics\n";
     std::cout << "  scheduler-start         - Begin generating dummy processes\n";
     std::cout << "  scheduler-stop          - Stop generating dummy processes\n";
     std::cout << "  report-util             - Show CPU utilization, save to csopesy-log.txt\n";
@@ -115,10 +138,11 @@ static std::string buildUtilReport() {
     }
     else {
         for (auto& p : finished) {
+            std::lock_guard<std::mutex> lock(p->mtx);
             oss << std::left << std::setw(12) << p->name
                 << "  " << fmtTime(p->createdAt)
-                << "    Finished"
-                << "    " << p->totalInstructions
+                << (p->memoryViolation ? "    Terminated" : "    Finished")
+                << "    " << p->instructionsExecuted
                 << " / " << p->totalInstructions << "\n";
         }
     }
@@ -150,6 +174,73 @@ static std::string buildUtilReport() {
 
 void printScreenLs() {
     std::cout << buildUtilReport();
+}
+
+// ---- main-menu "process-smi": nvidia-smi-style memory + process overview ----
+static std::string buildProcessSmiOverview() {
+    std::ostringstream oss;
+    size_t totalMem = memAlloc ? memAlloc->getTotalMemory() : 0;
+    size_t usedMem = memAlloc ? memAlloc->getUsedMemory() : 0;
+    size_t freeMem = (totalMem >= usedMem) ? (totalMem - usedMem) : 0;
+    double memUtil = totalMem > 0 ? (double)usedMem / (double)totalMem * 100.0 : 0.0;
+
+    int numCores = scheduler->getNumCores();
+    int busy = scheduler->coresInUse();
+    double cpuUtil = numCores > 0 ? (double)busy / numCores * 100.0 : 0.0;
+
+    oss << "==============================================\n";
+    oss << "| PROCESS-SMI V01.00   Driver Version: 01.00 |\n";
+    oss << "==============================================\n";
+    oss << "CPU-Util: " << std::fixed << std::setprecision(0) << cpuUtil << "%\n";
+    oss << "Memory Usage: " << usedMem << "B / " << totalMem << "B\n";
+    oss << "Memory Util: " << std::fixed << std::setprecision(0) << memUtil << "%\n";
+    oss << "Free Memory: " << freeMem << "B\n";
+    oss << "----------------------------------------------\n";
+    oss << "Running processes and memory usage:\n";
+    oss << "----------------------------------------------\n";
+
+    auto running = scheduler->getRunningProcesses();
+    bool any = false;
+    for (auto& p : running) {
+        if (!p) continue;
+        std::lock_guard<std::mutex> lock(p->mtx);
+        oss << std::left << std::setw(12) << p->name
+            << std::right << std::setw(8) << p->requestedMemSize << "B\n";
+        any = true;
+    }
+    if (!any) oss << "  (none)\n";
+    oss << "----------------------------------------------\n";
+    return oss.str();
+}
+
+// ---- main-menu "vmstat": detailed memory + CPU tick statistics ----
+static std::string buildVmstat() {
+    std::ostringstream oss;
+    size_t totalMem = memAlloc ? memAlloc->getTotalMemory() : 0;
+    size_t usedMem = memAlloc ? memAlloc->getUsedMemory() : 0;
+    size_t freeMem = (totalMem >= usedMem) ? (totalMem - usedMem) : 0;
+
+    uint64_t idleTicks = scheduler->getIdleCpuTicks();
+    uint64_t activeTicks = scheduler->getActiveCpuTicks();
+    uint64_t totalTicks = scheduler->getTotalCpuTicks();
+
+    int pagedIn = 0, pagedOut = 0;
+    if (memAlloc) {
+        if (auto* paging = dynamic_cast<PagingAllocator*>(memAlloc.get())) {
+            pagedIn = paging->getPagesPagedIn();
+            pagedOut = paging->getPagesPagedOut();
+        }
+    }
+
+    oss << std::right << std::setw(12) << totalMem << "  total memory (bytes)\n";
+    oss << std::right << std::setw(12) << usedMem << "  used memory (bytes)\n";
+    oss << std::right << std::setw(12) << freeMem << "  free memory (bytes)\n";
+    oss << std::right << std::setw(12) << idleTicks << "  idle cpu ticks\n";
+    oss << std::right << std::setw(12) << activeTicks << "  active cpu ticks\n";
+    oss << std::right << std::setw(12) << totalTicks << "  total cpu ticks\n";
+    oss << std::right << std::setw(12) << pagedIn << "  num paged in\n";
+    oss << std::right << std::setw(12) << pagedOut << "  num paged out\n";
+    return oss.str();
 }
 
 void reportUtil() {
@@ -187,7 +278,13 @@ static void processSmi(std::shared_ptr<Process> p) {
     }
     std::cout << "\nCurrent instruction line: " << p->instructionsExecuted << "\n";
     std::cout << "Lines of code: " << p->totalInstructions << "\n";
-    if (p->state == ProcessState::FINISHED) {
+    if (p->memoryViolation) {
+        std::ostringstream oss;
+        oss << std::hex << std::showbase << p->violationAddress;
+        std::cout << "Process " << p->name << " shut down due to memory access violation error that occurred at "
+            << p->violationTimestamp << ". " << oss.str() << " invalid.\n";
+    }
+    else if (p->state == ProcessState::FINISHED) {
         std::cout << "Finished!\n";
     }
 }
@@ -215,7 +312,9 @@ static void enterScreen(std::shared_ptr<Process> p) {
         else if (line == "process-smi") {
             if (p->state == ProcessState::FINISHED) {
                 processSmi(p);
-                std::cout << "(Process finished. Returning to main menu.)\n";
+                std::cout << (p->memoryViolation
+                    ? "(Process terminated. Returning to main menu.)\n"
+                    : "(Process finished. Returning to main menu.)\n");
 #ifdef _WIN32
                 system("cls");
 #else
@@ -250,7 +349,8 @@ static void batchGenLoop(std::vector<std::shared_ptr<Process>>* allProcesses, st
         }
         batchPidSeq++;
 
-        auto p = createProcess(pname, numInstr);
+        uint32_t memSize = rollPow2MemSize(config.minMemPerProc, config.maxMemPerProc, rng);
+        auto p = createProcess(pname, numInstr, memSize);
         {
             std::lock_guard<std::mutex> lock(*allMutex);
             allProcesses->push_back(p);
@@ -308,20 +408,24 @@ int main() {
                 // Attach a memory allocator if memory config is present. The
                 // concrete scheme (flat/first-fit vs. paging) is chosen by
                 // config.memScheme; Scheduler only ever sees IMemoryAllocator.
-                if (config.maxOverallMem > 0 && config.memPerProc > 0) {
+                if (config.maxOverallMem > 0 && config.maxMemPerProc > 0) {
                     if (config.memScheme == MemScheme::PAGING) {
                         memAlloc = std::make_unique<PagingAllocator>(
-                            config.maxOverallMem, config.memPerProc, config.memPerFrame);
-                        std::cout << "Memory allocator: paging, " << config.maxOverallMem
+                            config.maxOverallMem, config.maxMemPerProc, config.memPerFrame);
+                        std::cout << "Memory allocator: paging (demand), " << config.maxOverallMem
                             << " bytes total, " << config.memPerFrame << " bytes per frame.\n";
                     }
                     else {
                         memAlloc = std::make_unique<MemoryAllocator>(
-                            config.maxOverallMem, config.memPerProc, config.memPerFrame);
+                            config.maxOverallMem, config.maxMemPerProc, config.memPerFrame);
                         std::cout << "Memory allocator: flat/first-fit, " << config.maxOverallMem
-                            << " bytes total, " << config.memPerProc << " bytes per process.\n";
+                            << " bytes total.\n";
                     }
-                    scheduler->setMemoryAllocator(memAlloc.get(), config.memPerProc);
+                    // minMemPerProc/maxMemPerProc default is only used as a fallback
+                    // for processes with no per-process size set; each process
+                    // normally carries its own requestedMemSize (see screen -s/-c
+                    // and batchGenLoop).
+                    scheduler->setMemoryAllocator(memAlloc.get(), config.minMemPerProc);
                 }
 
                 scheduler->start();
@@ -357,26 +461,97 @@ int main() {
         else if (line == "screen -ls") {
             printScreenLs();
         }
+        else if (line == "process-smi") {
+            std::cout << buildProcessSmiOverview();
+        }
+        else if (line == "vmstat") {
+            std::cout << buildVmstat();
+        }
         else if (line.rfind("screen -s ", 0) == 0) {
-            std::string pname = line.substr(10);
-            if (pname.empty()) {
-                std::cout << "Usage: screen -s <process_name>\n";
+            std::string rest = line.substr(10);
+            std::istringstream iss(rest);
+            std::string pname, sizeTok;
+            iss >> pname >> sizeTok;
+            if (pname.empty() || sizeTok.empty()) {
+                std::cout << "Usage: screen -s <process_name> <process_memory_size>\n";
             }
             else {
-                std::lock_guard<std::mutex> lock(allProcessesMutex);
-                if (findProcess(pname, allProcesses) != nullptr) {
-                    std::cout << "Process '" << pname << "' already exists.\n";
+                long long size = 0;
+                bool parsedOk = true;
+                try { size = std::stoll(sizeTok); }
+                catch (...) { parsedOk = false; }
+
+                if (!parsedOk || !isValidMemSize(size)) {
+                    std::cout << "Invalid memory allocation.\n";
                 }
                 else {
-                    int numInstr = config.minIns;
-                    if (config.maxIns > config.minIns) {
-                        numInstr = config.minIns + (rand() % (config.maxIns - config.minIns + 1));
+                    std::lock_guard<std::mutex> lock(allProcessesMutex);
+                    if (findProcess(pname, allProcesses) != nullptr) {
+                        std::cout << "Process '" << pname << "' already exists.\n";
                     }
-                    auto p = createProcess(pname, numInstr);
-                    allProcesses.push_back(p);
-                    scheduler->addProcess(p);
-                    std::cout << "Process '" << pname << "' created and added to queue.\n";
+                    else {
+                        int numInstr = config.minIns;
+                        if (config.maxIns > config.minIns) {
+                            numInstr = config.minIns + (rand() % (config.maxIns - config.minIns + 1));
+                        }
+                        auto p = createProcess(pname, numInstr, static_cast<size_t>(size));
+                        allProcesses.push_back(p);
+                        scheduler->addProcess(p);
+                        std::cout << "Process '" << pname << "' created and added to queue.\n";
+                    }
                 }
+            }
+        }
+        else if (line.rfind("screen -c ", 0) == 0) {
+            std::string rest = line.substr(10);
+
+            // Split on the first/last double-quote: everything before is
+            // "<name> <size>", everything between is the instruction text.
+            size_t q1 = rest.find('"');
+            size_t q2 = (q1 == std::string::npos) ? std::string::npos : rest.rfind('"');
+
+            std::string pname, sizeTok, instrText;
+            if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1) {
+                std::istringstream hiss(rest.substr(0, q1));
+                hiss >> pname >> sizeTok;
+                instrText = rest.substr(q1 + 1, q2 - q1 - 1);
+            }
+
+            if (pname.empty() || sizeTok.empty() || instrText.empty()) {
+                std::cout << "Usage: screen -c <process_name> <process_memory_size> \"<instructions>\"\n";
+                continue;
+            }
+
+            long long size = 0;
+            bool parsedOk = true;
+            try { size = std::stoll(sizeTok); }
+            catch (...) { parsedOk = false; }
+
+            if (!parsedOk || !isValidMemSize(size)) {
+                std::cout << "Invalid memory allocation.\n";
+                continue;
+            }
+
+            std::vector<Instruction> program;
+            std::string parseError;
+            if (!InstructionParser::parse(instrText, program, parseError)) {
+                std::cout << "Invalid command: " << parseError << "\n";
+                continue;
+            }
+            if (program.size() < 1 || program.size() > 50) {
+                std::cout << "Invalid command: instruction count must be between 1 and 50.\n";
+                continue;
+            }
+
+            std::lock_guard<std::mutex> lock(allProcessesMutex);
+            if (findProcess(pname, allProcesses) != nullptr) {
+                std::cout << "Process '" << pname << "' already exists.\n";
+            }
+            else {
+                auto p = createProcessFromInstructions(pname, std::move(program), static_cast<size_t>(size));
+                allProcesses.push_back(p);
+                scheduler->addProcess(p);
+                std::cout << "Process '" << pname << "' created and added to queue.\n";
             }
         }
         else if (line.rfind("screen -r ", 0) == 0) {
@@ -386,7 +561,16 @@ int main() {
                 std::lock_guard<std::mutex> lock(allProcessesMutex);
                 p = findProcess(pname, allProcesses);
             }
-            if (!p || p->state == ProcessState::FINISHED) {
+            if (!p) {
+                std::cout << "Process " << pname << " not found.\n";
+            }
+            else if (p->memoryViolation) {
+                std::ostringstream oss;
+                oss << std::hex << std::showbase << p->violationAddress;
+                std::cout << "Process " << pname << " shut down due to memory access violation error that occurred at "
+                    << p->violationTimestamp << ". " << oss.str() << " invalid.\n";
+            }
+            else if (p->state == ProcessState::FINISHED) {
                 std::cout << "Process " << pname << " not found.\n";
             }
             else {
