@@ -63,8 +63,12 @@ static int countFlatInstructions(const std::vector<Instruction>& list) {
 
 std::shared_ptr<Process> createProcess(const std::string& name, int numInstructions, size_t memSize) {
     std::vector<Instruction> program;
-    // Default: randomized mix of DECLARE/ADD/SUBTRACT/SLEEP/PRINT/FOR.
-    program = insGen.generate(name, numInstructions);
+    // Default: randomized mix of DECLARE/ADD/SUBTRACT/SLEEP/PRINT/FOR/READ/WRITE.
+    // Passing memSize lets the generator include READ/WRITE targeting
+    // addresses within this process's own allocation, which is what
+    // actually drives demand-paging activity (page faults) for
+    // scheduler-generated processes.
+    program = insGen.generate(name, numInstructions, memSize);
 
     int flatTotal = countFlatInstructions(program);
     auto p = std::make_shared<Process>(name, pidCounter++, std::move(program), flatTotal, memSize);
