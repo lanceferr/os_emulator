@@ -122,18 +122,6 @@ public:
         return true;
     }
 
-    // Snapshot: write a simple textual dump to mem-snap-<quantum>.txt
-    void writeSnapshot(uint64_t quantumCounter)
-    {
-        std::ostringstream fname;
-        fname << "mem-snap-" << quantumCounter << ".txt";
-        std::ofstream out(fname.str());
-        if (out.is_open()) {
-            out << visualizeMemory();
-            out.close();
-        }
-    }
-
     int processesInMemory()
     {
         std::lock_guard<std::mutex> lock(mtx);

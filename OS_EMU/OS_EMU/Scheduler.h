@@ -46,13 +46,12 @@ private:
     // Memory manager (Week 10): depends on the interface only, so the
     // concrete scheme (flat/first-fit vs. paging) is swappable via config.
     IMemoryAllocator* memAlloc = nullptr; // optional; null = no memory management
-    std::atomic<uint64_t> quantumCounter; // how many full quantums have elapsed across all cores
     size_t memPerProc = 0;
 
 public:
     Scheduler(int numCores, SchedulerType type, uint32_t quantumCycles, uint32_t delaysPerExec)
         : numCores(numCores), type(type), quantumCycles(quantumCycles),
-        delaysPerExec(delaysPerExec), running(false), cpuTicks(0), idleCpuTicks(0), quantumCounter(0) {
+        delaysPerExec(delaysPerExec), running(false), cpuTicks(0), idleCpuTicks(0) {
         runningProcesses.resize(numCores, nullptr);
         quantumUsed.resize(numCores, 0);
         delayCounters.resize(numCores, 0);
@@ -281,26 +280,6 @@ private:
             }
 
             if (quantumExpired) {
-                // Write memory snapshot every quantum if memory manager is active.
-                if (memAlloc != nullptr) {
-                    uint64_t qq = ++quantumCounter;
-                    if (auto* flat = dynamic_cast<MemoryAllocator*>(memAlloc)) {
-                        flat->writeSnapshot(qq);
-                    }
-                    else if (auto* paging = dynamic_cast<PagingAllocator*>(memAlloc)) {
-                        paging->writeSnapshot(qq);
-                    }
-                    else {
-                        // fallback: write raw visualization
-                        std::ostringstream fname;
-                        fname << "mem-snap-" << qq << ".txt";
-                        std::ofstream out(fname.str());
-                        if (out.is_open()) {
-                            out << memAlloc->visualizeMemory();
-                            out.close();
-                        }
-                    }
-                }
                 // Preempt: process goes to the back of the ready queue, core is freed.
                 proc->state = ProcessState::READY;
                 proc->coreId = -1;
