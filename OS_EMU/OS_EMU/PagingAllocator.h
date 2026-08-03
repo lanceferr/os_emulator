@@ -225,8 +225,8 @@ public:
         std::lock_guard<std::mutex> lock(mtx);
 
         int pagesNeeded = static_cast<int>((size + frameSize - 1) / frameSize); // ceil
-        if (pagesNeeded > numFrames)
-            return nullptr; // can never fit, even with the whole machine free
+        //if (pagesNeeded > numFrames)
+        //    return nullptr; // can never fit, even with the whole machine free
 
         Allocation alloc;
         alloc.requestedSize = size;

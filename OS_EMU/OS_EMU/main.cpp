@@ -314,19 +314,19 @@ static void enterScreen(std::shared_ptr<Process> p) {
             break;
         }
         else if (line == "process-smi") {
-            if (p->state == ProcessState::FINISHED) {
-                processSmi(p);
-                std::cout << (p->memoryViolation
-                    ? "(Process terminated. Returning to main menu.)\n"
-                    : "(Process finished. Returning to main menu.)\n");
-#ifdef _WIN32
-                system("cls");
-#else
-                system("clear");
-#endif
-                printMenu();
-                break;
-            }
+//            if (p->state == ProcessState::FINISHED) {
+//                processSmi(p);
+//                std::cout << (p->memoryViolation
+//                    ? "(Process terminated. Returning to main menu.)\n"
+//                    : "(Process finished. Returning to main menu.)\n");
+//#ifdef _WIN32
+//                system("cls");
+//#else
+//                system("clear");
+//#endif
+//                printMenu();
+//                break;
+//            }
             processSmi(p);
         }
         else {
@@ -514,7 +514,7 @@ int main() {
             size_t q1 = rest.find('"');
             size_t q2 = (q1 == std::string::npos) ? std::string::npos : rest.rfind('"');
 
-            std::string pname, sizeTok, instrText;
+            std::string pname, sizeTok = "2048", instrText;
             if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1) {
                 std::istringstream hiss(rest.substr(0, q1));
                 hiss >> pname >> sizeTok;
@@ -574,9 +574,9 @@ int main() {
                 std::cout << "Process " << pname << " shut down due to memory access violation error that occurred at "
                     << p->violationTimestamp << ". " << oss.str() << " invalid.\n";
             }
-            else if (p->state == ProcessState::FINISHED) {
-                std::cout << "Process " << pname << " not found.\n";
-            }
+            //else if (p->state == ProcessState::FINISHED) {
+            //    std::cout << "Process " << pname << " not found.\n";
+            //}
             else {
                 enterScreen(p);
             }
