@@ -109,7 +109,7 @@ private:
                     frameOccupied[frame] = false;
                     frameOwnerAllocId[frame] = -1;
                     pagesPagedOut++;
-                    writeBackingStoreFile();
+                    //writeBackingStoreFile();
                     return true;
                 }
             }
@@ -129,11 +129,12 @@ private:
             {
                 frameData[frame] = it->second;
                 backingStore.erase(it);
-                writeBackingStoreFile();
+                pagesPagedIn++;
             }
             else
             {
                 std::fill(frameData[frame].begin(), frameData[frame].end(), 0);
+                pagesPagedIn++;
             }
             pagesPagedIn++;
         }
@@ -265,7 +266,7 @@ public:
         }
 
         allocations.erase(it);
-        writeBackingStoreFile();
+        //writeBackingStoreFile();
     }
 
     // --- Uniform memory-access interface (IMemoryAllocator) ---
@@ -314,6 +315,12 @@ public:
     int getPagesPagedIn() { return pagesPagedIn.load(); }
     int getPagesPagedOut() { return pagesPagedOut.load(); }
 
+    void flushBackingStoreFile()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        writeBackingStoreFile();
+    }
+
     size_t internalFragmentation()
     {
         std::lock_guard<std::mutex> lock(mtx);
@@ -348,5 +355,17 @@ public:
                 << "\n";
         }
         return out.str();
+    }
+
+    bool ensureAllResident(void* h)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        intptr_t id = reinterpret_cast<intptr_t>(h);
+        auto it = allocations.find(id);
+        if (it == allocations.end()) return false;
+        Allocation& alloc = it->second;
+        for (size_t p = 0; p < alloc.pageTable.size(); p++)
+            if (!ensurePageResident(id, alloc, p)) return false;
+        return true;
     }
 };

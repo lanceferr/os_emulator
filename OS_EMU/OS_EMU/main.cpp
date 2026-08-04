@@ -469,6 +469,9 @@ int main() {
             std::cout << buildProcessSmiOverview();
         }
         else if (line == "vmstat") {
+            if (auto* paging = dynamic_cast<PagingAllocator*>(memAlloc.get())) {
+                paging->flushBackingStoreFile();
+            }
             std::cout << buildVmstat();
         }
         else if (line.rfind("screen -s ", 0) == 0) {

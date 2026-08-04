@@ -181,7 +181,6 @@ private:
             }
 
             if (!proc) {
-                // Pull a new process from the ready queue (skip ones still sleeping).
                 std::unique_lock<std::mutex> lock(queueMutex);
                 queueCV.wait_for(lock, std::chrono::milliseconds(20), [this] {
                     return !readyQueue.empty() || !running.load();
@@ -189,22 +188,33 @@ private:
                 if (!running.load()) break;
                 if (readyQueue.empty()) { idleCpuTicks++; continue; }
 
-                proc = readyQueue.front();
-
-                // If it's sleeping, tick down its counter and requeue at the back
-                // rather than dispatching it. This keeps the core free for others.
-                if (proc->state == ProcessState::WAITING) {
+                // Scan up to queue-size items to find a READY process, cycling any
+                // WAITING ones to the back (ticking their sleep counters) along the way.
+                size_t scanLimit = readyQueue.size();
+                bool foundReady = false;
+                for (size_t i = 0; i < scanLimit; i++) {
+                    auto candidate = readyQueue.front();
                     readyQueue.pop();
-                    if (proc->sleepTicksRemaining > 0) proc->sleepTicksRemaining--;
-                    if (proc->sleepTicksRemaining == 0) {
-                        proc->state = ProcessState::READY;
+
+                    if (candidate->state == ProcessState::WAITING) {
+                        if (candidate->sleepTicksRemaining > 0) candidate->sleepTicksRemaining--;
+                        if (candidate->sleepTicksRemaining == 0) {
+                            candidate->state = ProcessState::READY;
+                        }
+                        readyQueue.push(candidate);
+                        continue; // keep scanning
                     }
-                    readyQueue.push(proc);
+
+                    proc = candidate;
+                    foundReady = true;
+                    break;
+                }
+
+                if (!foundReady) {
                     idleCpuTicks++;
                     continue;
                 }
 
-                readyQueue.pop();
                 lock.unlock();
 
                 // Memory allocation check: if a memory manager is attached,
@@ -229,6 +239,13 @@ private:
                     proc->memAllocRef = memAlloc; // lets Process execute READ/WRITE directly
                 }
 
+                // Force the process's full footprint resident on every dispatch.
+                // With quantum-cycles as low as 1, this happens every instruction,
+                // matching the "page in/out attempted for every instruction" model.
+                if (auto* paging = dynamic_cast<PagingAllocator*>(memAlloc)) {
+                    paging->ensureAllResident(proc->memHandle);
+                }
+
                 {
                     std::lock_guard<std::mutex> rlock(runningMutex);
                     proc->state = ProcessState::RUNNING;
@@ -245,7 +262,7 @@ private:
                 if (delayCounters[coreId] > 0) {
                     delayCounters[coreId]--;
                     cpuTicks++;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    std::this_thread::sleep_for(std::chrono::microseconds(10));
                     continue;
                 }
             }
@@ -289,7 +306,7 @@ private:
                 queueCV.notify_one();
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::this_thread::sleep_for(std::chrono::microseconds(5));
         }
     }
 };

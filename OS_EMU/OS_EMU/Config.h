@@ -31,7 +31,7 @@ struct Config {
 
 // MO2: all process/frame memory sizes must be a power of two in [2^6, 2^16] bytes.
 inline bool isValidMemSize(long long v) {
-    if (v < 64 || v > 65536) return false;
+    if (v < 2 || v > 65536) return false;
     return (v & (v - 1)) == 0;
 }
 
